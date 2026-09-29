@@ -1,0 +1,1644 @@
+#!/bin/bash
+
+# The sourcetree datafile format parser
+# File extensions commonly: *.sources file / *.🌲︎
+#
+# This accepts and parses annotated data text files that hold human-readable data.
+# If you need better data representation, it is necessary to
+# create a full data type validated format based on this format.
+#
+# Example:
+# data_type:
+#		data: <<< "weblinks.txt" # [this symbolizes the current parser state]
+#		type: string			 # everything else is new and to do
+#		validator_type: regex
+#		validator_regex: "[a-z]"
+#
+# example source file:
+### source from: https://www.nationalparks.nsw.gov.au/plants-and-animals/wollemi-pine
+##
+## path=4wbj8hr8dtpph
+## prefix=
+#https://share.viostream.com/4wbj8hr8dtpph
+#
+## path=4wbj8hr8dttys
+## prefix=
+## =raw data line, not interpreted format
+#https://share.viostream.com/4wbj8hr8dttys
+#
+## path=4wbj8hr8dts8z
+### text comment line
+### ### # # # # # #  another text comment line
+### C = 3 the assignment operator character is not parsed, this is another text comment line
+## prefix=
+#https://share.viostream.com/4wbj8hr8dts8z
+#
+## path=4wbj8hr8dthib
+## prefix=
+#https://share.viostream.com/4wbj8hr8dthib
+#
+## path=4wbj8hr8dth3u
+## prefix=
+### ### # # # # # #  DATA ^1111111111111111111 3u
+#https://share.viostream.com/4wbj8hr8dth3u
+# example source file end.
+
+declare -a sources_list=()           # indexed by entry number
+declare -A source_to_indices=()      # key = source string, value = space-separated list of indices (fast duplicate lookup)
+declare -a sources_metadata=()       # flat array of all metadata lines
+declare -a metadata_positions=()     # indexed by entry number, value = "start:length"
+entry_counter=0
+
+parse_sources_path() {
+	local dir="$1"
+	local max_depth="${2:-1}"
+	shift 2 || shift || :
+	local -a extra=("$@")
+
+	[[ -d "$dir" ]] || { __warn "not a directory %s" "$dir"; return 1; }
+
+	local first=true
+	local find_depth=()
+	if (( max_depth >= 0 )); then
+		find_depth=(-maxdepth "$max_depth")
+	fi
+
+	local f
+	while IFS= read -r -d '' f; do
+		if $first; then
+			parse_sources_file "${extra[@]}" "$f"
+			first=false
+		else
+			parse_sources_file --append "${extra[@]}" "$f"
+		fi
+	done < <(
+		find "$dir" "${find_depth[@]}" \( -name '*.sources' -o -name '*.txt' -o -name '*.🌲︎' \) -type f -print0 \
+		| while IFS= read -r -d '' f; do
+			printf '%s\t%s\0' "$(basename -- "$f")" "$f"
+		done \
+		| LC_ALL=C sort -z -t $'\t' -k1,1V \
+		| cut -z -f2-
+	)
+
+	if $first; then
+		__warn "no *.sources/*.txt/*.🌲︎ under %s" "$dir"
+		return 1
+	fi
+}
+
+function parse_sources_file() {
+	local append=false
+	new_line_format=false
+	warn_on_ids=false
+	local require_last_new_line=false
+
+	while (($# > 0)); do
+		case "$1" in
+			--append) append=true; shift ;;
+			--warn-on-ids) warn_on_ids=true; shift ;;
+			--new-line-format) new_line_format=true; shift ;;
+			--require-last-new-line) require_last_new_line=true; shift ;;
+			--) shift; break ;;
+			-*) __error "parse_sources_file: unknown option %s" "$1"; return 1 ;;
+			*) break ;;
+		esac
+	done
+
+	local sources_file="${1-}"
+	[[ -n "$sources_file" && -f "$sources_file" ]] || { __warn "Error: File not found %s" "$sources_file"; return 1; }
+
+	if ! $append; then
+		sources_list=()
+		source_to_indices=()
+		sources_metadata=()
+		metadata_positions=()
+		entry_counter=0
+		sources_newline_errors=()
+	fi
+
+	local is_preamble=true
+	local within_preamble=false
+	local require_blank_before_next=false
+	declare -a _current_metadata_collection=()
+
+	commit_sources_entry() {
+		local data_line="${1-}"
+		(( ${#_current_metadata_collection[@]} == 0 )) && [[ -z "$data_line" ]] && return 0
+
+		local index="${#sources_list[@]}"
+		local meta_id preset_uscore
+		meta_id="$(_get_metadata_by_key_from_current_metadata "_id" "${_current_metadata_collection[@]}")"
+		preset_uscore="$(_get_metadata_by_key_from_current_metadata "_" "${_current_metadata_collection[@]}")"
+
+		local stored="$data_line"
+		if [[ -n "$data_line" ]]; then
+			if [[ -n "$preset_uscore" ]]; then
+				__warn "entry %s: # _=%s ignored; data line is %s" \
+					"$entry_counter" "$preset_uscore" "$data_line"
+			fi
+			_set_metadata_by_key_from_current_metadata "_" "$data_line" "_current_metadata_collection"
+		else
+			stored="${preset_uscore}"
+			[[ -n "$preset_uscore" ]] || _current_metadata_collection+=("true:_=")
+		fi
+
+		sources_list[$index]="$stored"
+
+		local entry_key="$stored"
+		if [[ -n "$meta_id" ]]; then
+			entry_key="$meta_id"
+		elif [[ -z "$stored" ]]; then
+			entry_key="$index"
+		fi
+
+		_set_metadata_by_key_from_current_metadata "_entry_number" "$entry_counter" "_current_metadata_collection"
+		((entry_counter++)) || :
+
+		if [[ -n "${source_to_indices[$entry_key]+set}" ]]; then
+			source_to_indices["$entry_key"]="${source_to_indices[$entry_key]} $index"
+		else
+			source_to_indices["$entry_key"]="$index"
+		fi
+
+		metadata_positions[$index]="${#sources_metadata[@]}:${#_current_metadata_collection[@]}"
+		sources_metadata+=("${_current_metadata_collection[@]}")
+		_current_metadata_collection=()
+
+		if $new_line_format && [[ -n "$data_line" ]]; then
+			require_blank_before_next=true
+		fi
+	}
+
+	note_missing_blank() {
+		$new_line_format && $require_blank_before_next || return 0
+		sources_newline_errors+=("$entry_counter")
+		require_blank_before_next=false
+	}
+
+	local line
+	while IFS= read -r line || [[ -n "$line" ]]; do
+		line="${line#"${line%%[![:space:]]*}"}"
+		line="${line%"${line##*[![:space:]]}"}"
+
+		if $is_preamble; then
+			if $within_preamble && [[ -z "$line" ]]; then
+				continue
+			elif [[ "$line" =~ ^#(#)+ ]]; then
+				within_preamble=true
+				continue
+			fi
+		fi
+		is_preamble=false
+		within_preamble=false
+
+		if [[ -z "$line" ]]; then
+			commit_sources_entry ""
+			require_blank_before_next=false
+			continue
+		fi
+
+		if [[ "$line" =~ ^# ]]; then
+			if (( ${#_current_metadata_collection[@]} == 0 )); then
+				note_missing_blank
+			fi
+			if [[ "$line" =~ ^([#[:space:]]+)(.*)$ ]]; then
+				local is_data additional_hashes_count line_value
+				additional_hashes_count="${BASH_REMATCH[1]}"
+				additional_hashes_count="${additional_hashes_count//[^#]}"
+				additional_hashes_count="${#additional_hashes_count}"
+				((additional_hashes_count--))
+				((additional_hashes_count == 0)) && is_data=true || is_data=false
+				line_value="${BASH_REMATCH[2]}"
+				[[ -n "$line_value" ]] && _current_metadata_collection+=("$is_data:$line_value")
+			fi
+		else
+			if (( ${#_current_metadata_collection[@]} == 0 )); then
+				note_missing_blank
+			fi
+			commit_sources_entry "$line"
+		fi
+	done < "$sources_file"
+
+	if $require_last_new_line && $new_line_format && $require_blank_before_next; then
+		sources_newline_errors+=("$entry_counter")
+	fi
+	commit_sources_entry ""
+}
+
+_set_metadata_by_key_from_current_metadata() {
+	local key="$1"
+	local value="$2"
+	local -n collection="$3"
+
+	local found=false
+
+	local i
+	for ((i=0; i<${#collection[@]}; i++)); do
+		if [[ "${collection[i]}" == true:$key=* ]]; then
+			collection[i]="true:$key=$value"
+			found=true
+			break
+		fi
+	done
+
+	if ! $found; then
+		collection+=("true:$key=$value")
+	fi
+}
+
+_get_metadata_by_key_from_current_metadata() {
+	local key="$1"
+	shift ||:
+	local -a collection=("$@")
+
+	local entry
+	for entry in "${collection[@]}"; do
+		if [[ "$entry" == true:$key=* ]]; then
+			local id="${entry#true:$key=}"
+
+			[[ -n "$id" ]] && echo "$id" && return 0
+		fi
+	done
+}
+
+get_metadata_collection() {
+	local index="$1"
+
+	local position="${metadata_positions[$index]}"
+	local start="${position%%:*}"
+	local length="${position#*:}"
+
+	local i
+	for ((i=0; i<length; i++)); do
+		local metadata_entry="${sources_metadata[start + i]}"
+		echo "$metadata_entry"
+	done
+}
+
+filter_metadata_collection() {
+	local index="$1"
+	shift ||:
+	local known_fields=("$@")
+
+	local position="${metadata_positions[$index]}"
+	local start="${position%%:*}"
+	local length="${position#*:}"
+
+	local i
+	for ((i=0; i<length; i++)); do
+		local metadata_entry="${sources_metadata[start + i]}"
+		if [[ "$metadata_entry" == true:* ]]; then
+			local kv="${metadata_entry#true:}"
+			local key="${kv%%"="*}"
+			local value="${kv#*"="}"
+			if [[ -n "$key" ]] && ! __array_contains "$key" "${known_fields[@]}"; then
+				echo "$key"
+			fi
+		fi
+	done
+}
+
+has_metadata() {
+	local key_name="$1"
+	local index="$2"
+	local position="${metadata_positions[$index]-}"
+	[[ -z "$position" ]] && return 1
+
+	local start="${position%%:*}"
+	local length="${position#*:}"
+	local i metadata_entry
+	for ((i = 0; i < length; i++)); do
+		metadata_entry="${sources_metadata[start + i]}"
+		[[ "$metadata_entry" == true:$key_name=* ]] && return 0
+	done
+	return 1
+}
+
+value_is_empty() {
+	local key_name="$1"
+	local index="$2"
+
+	local position="${metadata_positions[$index]-}"
+	[[ -z "$position" ]] && return 1
+
+	local start="${position%%:*}"
+	local length="${position#*:}"
+	local i metadata_entry value found=false
+	for ((i = 0; i < length; i++)); do
+		metadata_entry="${sources_metadata[start + i]}"
+		if [[ "$metadata_entry" == true:$key_name=* ]]; then
+			found=true
+			value="${metadata_entry#true:$key_name=}"
+			[[ -n "$value" ]] && return 1
+		fi
+	done
+	$found
+}
+
+get_metadata() {
+	local key_name="$1"
+	local index="$2"
+
+	local position="${metadata_positions[$index]-}"
+	[[ -z "$position" ]] && return 1
+
+	local start="${position%%:*}"
+	local length="${position#*:}"
+
+	local i
+	for ((i=0; i<length; i++)); do
+		local metadata_entry="${sources_metadata[start + i]}"
+		if [[ "$metadata_entry" == true:$key_name=* ]]; then
+			local value="${metadata_entry#true:$key_name=}"
+
+			[[ -n "$value" ]] && echo "$value" && return 0
+		fi
+	done
+}
+
+parent_index_of() {
+	local index="$1"
+	local p="${entry_parent_index[$index]-}"
+	[[ -n "$p" ]] || return 1
+	echo "$p"
+}
+
+get_entry_index_by_keyvalue() {
+	local key="$1"
+	local value="$2"
+
+	local index
+	for ((index=0; index<${#sources_list[@]}; index++)); do
+		local position="${metadata_positions[$index]}"
+		local start="${position%%:*}"
+		local length="${position#*:}"
+
+		for ((i=0; i<length; i++)); do
+			if [[ "${sources_metadata[start + i]}" == "true:$key=$value" ]]; then
+				echo "$index"
+				return 0
+			fi
+		done
+	done
+
+	return 1
+}
+
+set_metadata() {
+	local key_name="$1"
+	local value="$2"
+	local index="$3"
+
+	local position="${metadata_positions[$index]}"
+	local start="${position%%:*}"
+	local length="${position#*:}"
+
+	# Try to update existing key first
+	local i
+	for ((i=0; i<length; i++)); do
+		if [[ "${sources_metadata[start + i]}" == true:$key_name=* ]]; then
+			sources_metadata[start + i]="true:$key_name=$value"
+			return 0
+		fi
+	done
+
+	# Key not found → insert at the end of this index's metadata block
+	local insert_pos=$((start + length))
+	sources_metadata=("${sources_metadata[@]:0:$insert_pos}" "true:$key_name=$value" "${sources_metadata[@]:$insert_pos}")
+
+	# Update length for this index
+	metadata_positions[$index]="${start}:$((length + 1))"
+
+	# Shift start position of all later entries (+1)
+	local j
+	for ((j=index+1; j<${#metadata_positions[@]}; j++)); do
+		local pos="${metadata_positions[$j]}"
+		local s="${pos%%:*}"
+		local l="${pos#*:}"
+		metadata_positions[$j]="$((s + 1)):$l"
+	done
+}
+
+remove_metadata() {
+	local key_name="$1"
+	local index="$2"
+
+	local position="${metadata_positions[$index]}"
+	local start="${position%%:*}"
+	local length="${position#*:}"
+
+	local -a new_block=()
+	local removed=false
+
+	local i
+	for ((i=0; i<length; i++)); do
+		local entry="${sources_metadata[start + i]}"
+		if [[ "$entry" == true:$key_name=* ]]; then
+			removed=true
+			continue
+		fi
+		new_block+=("$entry")
+	done
+
+	if $removed; then
+		# Remove the old block and insert the new one
+		sources_metadata=("${sources_metadata[@]:0:$start}" "${new_block[@]}" "${sources_metadata[@]:$((start + length))}")
+
+		# Update position for this index
+		metadata_positions[$index]="${start}:${#new_block[@]}"
+
+		# Shift positions of all later entries (because we removed one line)
+		local j
+		for ((j=index+1; j<${#metadata_positions[@]}; j++)); do
+			local pos="${metadata_positions[$j]}"
+			local s="${pos%%:*}"
+			local l="${pos#*:}"
+			metadata_positions[$j]="$((s - 1)):$l"
+		done
+	fi
+}
+
+get_entry_key() {
+	local index="$1"
+	local id
+	id="$(get_metadata "_id" "$index")"
+	if [[ -n "$id" ]]; then
+		printf '%s\n' "$id"
+		return 0
+	fi
+	local source="${sources_list[$index]-}"
+	if [[ -n "$source" ]]; then
+		printf '%s\n' "$source"
+		return 0
+	fi
+	printf '%s\n' "$index"
+}
+
+is_reference_node() {
+	local id
+	id="$(get_metadata "_id" "$1")"
+	[[ "$id" == *"※"* ]]
+}
+
+is_under_reference() {
+	local walk="$1"
+	local parent parent_index
+	local -A seen=()
+
+	while [[ -n "$walk" ]]; do
+		[[ -n "${seen[$walk]+set}" ]] && return 1
+		seen["$walk"]=1
+
+		parent="$(get_metadata "_parent" "$walk")"
+		[[ -z "$parent" ]] && return 1
+
+		parent_index="$(get_entry_index_by_keyvalue "_id" "$parent")" || return 1
+		is_reference_node "$parent_index" && return 0
+		walk="$parent_index"
+	done
+	return 1
+}
+
+is_attribute_node() {
+	local parent id type kind
+	parent="$(get_metadata "_parent" "$1")"
+	[[ -z "$parent" ]] && return 1
+	is_reference_node "$1" && return 1
+
+	id="$(get_metadata "_id" "$1")"
+	type="$(get_metadata "_type" "$1")"
+	kind="${type#*:}"
+	type="${type%%:*}"
+	[[ "$type" == "$kind" ]] && kind=""
+
+	[[ "$type" == "attribute" || "$kind" == "attribute" ]] && return 0
+	[[ -z "$id" ]] && return 0
+	is_under_reference "$1"
+}
+
+is_title_node() {
+	is_reference_node "$1" && return 1
+	is_attribute_node "$1" && return 1
+	return 0
+}
+
+has_title_descendant() {
+	local index="$1"
+	local own_id child_index
+	own_id="$(get_metadata "_id" "$index")"
+	[[ -z "$own_id" ]] && return 1
+
+	local children_string="${parent_to_children[$own_id]-}"
+	local -a children=($children_string)
+	for child_index in "${children[@]}"; do
+		is_title_node "$child_index" && return 0
+		has_title_descendant "$child_index" && return 0
+	done
+	return 1
+}
+
+declare -a tree_order=()
+declare -A parent_to_children=()
+declare -a entry_depth=()
+declare -a entry_parent_index=()   # child index → parent index
+declare -A in_recursion_path=()
+declare -a sources_newline_errors=()
+new_line_format=false
+
+validate_tree() {
+	local return_status=0
+	local status=0
+	validate_parent_references || status="$?" && (( return_status == 0 )) && return_status="$status"
+	validate_unique_ids || status="$?" && (( return_status == 0 )) && return_status="$status"
+	validate_newline_format || status="$?" && (( return_status == 0 )) && return_status="$status"
+	validate_node_grammar || status="$?" && (( return_status == 0 )) && return_status="$status"
+
+	return "$return_status"
+}
+
+validate_parent_references() {
+	local errors=0
+	local index
+	for ((index=0; index<${#sources_list[@]}; index++)); do
+		local parent_value
+		parent_value="$(get_metadata "_parent" "$index")"
+
+		if [[ -n "$parent_value" ]]; then
+			if ! get_entry_index_by_keyvalue "_id" "$parent_value" > "/dev/null" 2>&1; then
+				entry_number="$(get_metadata "_entry_number" "$index")"
+				echo "ERROR: entry $entry_number: parent id '$parent_value' referenced by index $index does not match any id" >&2
+				((errors++))
+			fi
+		fi
+	done
+
+	if (( errors > 0 )); then
+		echo "ERROR: Found $errors invalid parent reference(s). Aborting tree generation." >&2
+		return 1
+	fi
+
+	return 0
+}
+
+validate_unique_ids() {
+	local errors=0
+	local index id
+	local -A seen_ids=()
+	for ((index = 0; index < ${#sources_list[@]}; index++)); do
+		id="$(get_metadata "_id" "$index")"
+		[[ -z "$id" ]] && continue
+		if [[ -n "${seen_ids[$id]+set}" ]]; then
+			echo "ERROR: duplicate _id '$id' at indices ${seen_ids[$id]} and $index" >&2
+			((errors++))
+		else
+			seen_ids["$id"]="$index"
+		fi
+	done
+	(( errors == 0 ))
+}
+
+validate_newline_format() {
+	$new_line_format || return 0
+	(( ${#sources_newline_errors[@]} == 0 )) && return 0
+	local n
+	for n in "${sources_newline_errors[@]}"; do
+		echo "ERROR: --new-line-format: missing blank line after node $n" >&2
+	done
+	return 1
+}
+
+validate_node_grammar() {
+	local errors=0 index id parent parent_index
+	for ((index = 0; index < ${#sources_list[@]}; index++)); do
+		id="$(get_metadata "_id" "$index")"
+		parent="$(get_metadata "_parent" "$index")"
+
+		if [[ "$id" == *"※"*"※"* ]]; then
+			echo "ERROR: entry $index: _id may contain only one ※: $id" >&2
+			((errors++))
+		fi
+
+		if is_attribute_node "$index" && [[ -z "$parent" ]]; then
+			echo "ERROR: entry $index: attribute+ cannot be a root" >&2
+			((errors++))
+		fi
+
+		[[ -z "$parent" ]] && continue
+		parent_index="$(get_entry_index_by_keyvalue "_id" "$parent")" || parent_index=""
+		[[ -z "$parent_index" ]] && continue
+
+		if is_reference_node "$index" && is_attribute_node "$parent_index"; then
+			echo "ERROR: entry $index: reference+ under attribute+" >&2
+			((errors++))
+		fi
+		if is_title_node "$index" && is_reference_node "$parent_index"; then
+			echo "ERROR: entry $index: title+ under reference+" >&2
+			((errors++))
+		fi
+		if is_title_node "$index" && is_attribute_node "$parent_index"; then
+			echo "ERROR: entry $index: title+ under attribute+" >&2
+			((errors++))
+		fi
+	done
+	(( errors == 0 ))
+}
+
+test_only_has_anonymous_leaves() {
+	local index="$1"
+	local own_id
+	own_id="$(get_metadata "_id" "$index")"
+	[[ -z "$own_id" ]] && return 0
+
+	local children_string="${parent_to_children[$own_id]-}"
+	local -a children=($children_string)
+	local child_index child_id
+	for child_index in "${children[@]}"; do
+		child_id="$(get_metadata "_id" "$child_index")"
+		[[ -n "$child_id" ]] && return 1
+		if ! test_only_has_anonymous_leaves "$child_index"; then
+			return 1
+		fi
+	done
+	return 0
+}
+
+is_dual_root_node() {
+	local index="$1"
+	local depth="${2-}"
+	local own_id
+	own_id="$(get_metadata "_id" "$index")"
+	[[ "$own_id" == *"※"* ]] || return 1
+	if [[ -n "$depth" ]]; then
+		(( depth == 0 )) || return 1
+	else
+		local parent
+		parent="$(get_metadata "_parent" "$index")"
+		[[ -z "$parent" ]] || return 1
+	fi
+	test_only_has_anonymous_leaves "$index"
+}
+
+resolved_type() {
+	local index="$1"
+	local type=""
+	while [[ -n "$index" ]]; do
+		type="$(get_metadata "_type" "$index")"
+		if [[ -n "$type" ]]; then
+			printf '%s\n' "$type"
+			return 0
+		fi
+		index="$(parent_index_of "$index")" || break
+	done
+	return 1
+}
+
+is_attribute_under_reference() {
+	local index="$1"
+	local own_id
+	own_id="$(get_metadata "_id" "$index")"
+	[[ "$own_id" == *"※"* ]] && return 1
+
+	local p pid
+	p="$(parent_index_of "$index")" || return 1
+	while [[ -n "$p" ]]; do
+		pid="$(get_metadata "_id" "$p")"
+		[[ "$pid" == *"※"* ]] && return 0
+		p="$(parent_index_of "$p")" || break
+	done
+	return 1
+}
+
+generate_tree() {
+	local depth_limit="${1:-"-1"}"
+	local exclude_parent_with_only_anonymous_nodes="${2:-false}"
+	local exclude_any_non_anonymous_parent_without_children="${3:-false}"
+	local select_category="${4:-""}"
+
+	tree_order=()
+	parent_to_children=()
+	entry_depth=()
+	entry_parent_index=()
+	in_recursion_path=()
+
+	local current_depth="0"
+	declare -a roots=()
+
+	if (( depth_limit != -1 && current_depth >= depth_limit )); then
+		return 0
+	fi
+
+	local index parent parent_index
+	for ((index = 0; index < ${#sources_list[@]}; index++)); do
+		parent="$(get_metadata "_parent" "$index")"
+		id="$(get_metadata "_id" "$index")"
+
+		if [[ -z "$parent" && "$id" == *"※"* && "$id" != *"※"*"※"* ]]; then
+			local star_right="${id#*※}"
+			if [[ -n "$star_right" ]] && get_entry_index_by_keyvalue "_id" "$star_right" >/dev/null 2>&1; then
+				parent="$star_right"
+				set_metadata "_parent" "$parent" "$index"
+			fi
+		fi
+		parent_index=""
+		if [[ -n "$parent" ]]; then
+			parent_index="$(get_entry_index_by_keyvalue "_id" "$parent")" || parent_index=""
+		fi
+
+		if [[ -n "$parent_index" ]]; then
+			entry_parent_index["$index"]="$parent_index"
+			if [[ -n "${parent_to_children[$parent]+set}" ]]; then
+				parent_to_children["$parent"]="${parent_to_children[$parent]} $index"
+			else
+				parent_to_children["$parent"]="$index"
+			fi
+		else
+			roots+=("$index")
+		fi
+	done
+
+	local root_index
+	for root_index in "${roots[@]}"; do
+		local root_id
+		root_id="$(get_metadata "_id" "$root_index")"
+		if [[ "$root_id" == *"※"* ]] && has_title_descendant "$root_index"; then
+			__warn "%s" "root reference $root_id has a title+ descendant; title+ under reference+ is invalid"
+		fi
+	done
+
+	for root_index in "${roots[@]}"; do
+		_add_to_tree "$root_index" "$current_depth" "$depth_limit" "$exclude_parent_with_only_anonymous_nodes" "$exclude_any_non_anonymous_parent_without_children" "$select_category" false
+	done
+}
+
+_add_to_tree() {
+	local index="$1"
+	local current_depth="$2"
+	local depth_limit="$3"
+	local exclude_parent_with_only_anonymous_nodes="$4"
+	local exclude_any_non_anonymous_parent_without_children="$5"
+	local select_category="$6"
+	local under_selected="${7:-false}"
+
+	local entry_key
+	entry_key="$(get_entry_key "$index")"
+
+	if [[ -n "${in_recursion_path[$index]+set}" ]]; then
+		echo "ERROR: Circular reference detected involving index $index (key: $entry_key)" >&2
+		return 1
+	fi
+
+	in_recursion_path[$index]=1
+
+	local own_id
+	own_id="$(get_metadata "_id" "$index")"
+
+	local has_children=false
+	if [[ -n "$own_id" && -n "${parent_to_children[$own_id]+set}" ]]; then
+		has_children=true
+	fi
+
+	local marked_reference=false
+	if [[ "$own_id" == *"※"* ]]; then
+		marked_reference=true
+	fi
+
+	local is_reference_cluster=false
+	if $marked_reference; then
+		is_reference_cluster=true
+	fi
+
+	local is_dual_root=false
+	if (( current_depth == 0 )) && $marked_reference && test_only_has_anonymous_leaves "$index"; then
+		is_dual_root=true
+	fi
+
+	local category
+	category="$(get_metadata "_category" "$index")"
+
+	local is_selected=false
+	if [[ -n "$select_category" && -n "$category" && "$category" == "$select_category" ]]; then
+		is_selected=true
+	fi
+
+	# Selected → same inclusion rules as a reference cluster
+	if $is_selected; then
+		is_reference_cluster=true
+	fi
+
+	local has_enriching_fields=false
+	local position="${metadata_positions[$index]:-}"
+	if [[ -n "$position" ]]; then
+		local start="${position%%:*}"
+		local length="${position#*:}"
+		local i
+		for ((i=0; i<length; i++)); do
+			local metadata_entry="${sources_metadata[start + i]}"
+			if [[ "$metadata_entry" == true:* ]]; then
+				local kv="${metadata_entry#true:}"
+				local field_key="${kv%%"="*}"
+				if [[ -n "$field_key" && "$field_key" != "_" && "$field_key" != _* ]]; then
+					has_enriching_fields=true
+					break
+				fi
+			fi
+		done
+	fi
+
+	local include_node=true
+	local under_reference=false
+	if is_attribute_under_reference "$index"; then
+		under_reference=true
+	fi
+
+	if $exclude_parent_with_only_anonymous_nodes; then
+		if $is_dual_root || $is_reference_cluster || $is_selected || $under_selected || $under_reference; then
+			include_node=true
+		elif test_only_has_anonymous_leaves "$index"; then
+			include_node=false
+		fi
+	fi
+
+	if $exclude_any_non_anonymous_parent_without_children; then
+		if $is_dual_root; then
+			include_node=true
+		elif $is_reference_cluster || $is_selected; then
+			include_node=false
+		elif [[ -n "$category" ]]; then
+			# Title catalog: categorized node belongs to the selected catalog
+			include_node=false
+		elif (( current_depth > 0 )) && ! $has_enriching_fields; then
+			local parent_id
+			parent_id="$(get_metadata "_parent" "$index")"
+			if [[ -n "$parent_id" ]]; then
+				local parent_index=""
+				parent_index="$(get_entry_index_by_keyvalue "_id" "$parent_id")" || parent_index=""
+				if [[ -n "$parent_index" ]]; then
+					local my_type parent_type
+					my_type="$(get_metadata "_type" "$index")"
+					parent_type="$(get_metadata "_type" "$parent_index")"
+					if [[ -n "$my_type" && "$my_type" == "$parent_type" && "${sources_list[$index]}" == "${sources_list[$parent_index]}" ]]; then
+						local has_non_reference_child=false
+						local children_string="${parent_to_children[$own_id]-}"
+						local -a children=($children_string)
+						local child_index
+						for child_index in "${children[@]}"; do
+							local child_id
+							child_id="$(get_metadata "_id" "$child_index")"
+							if [[ "$child_id" != *"※"* ]]; then
+								has_non_reference_child=true
+								break
+							fi
+						done
+						if ! $has_non_reference_child; then
+							include_node=false
+						fi
+					fi
+				fi
+			fi
+		fi
+	fi
+
+	if [[ -n "$category" && -n "$select_category" ]]; then
+		if $is_selected; then
+			include_node=true
+		else
+			include_node=false
+		fi
+	fi
+
+	if $include_node; then
+		tree_order+=("$index")
+		entry_depth[$index]=$current_depth
+	else
+		unset in_recursion_path[$index]
+		return 0
+	fi
+
+	if (( depth_limit != -1 && current_depth + 1 >= depth_limit )); then
+		unset in_recursion_path[$index]
+		return 0
+	fi
+
+	local child_under_selected=false
+	if $is_selected || $under_selected; then
+		child_under_selected=true
+	fi
+
+	if $has_children; then
+		local children_string="${parent_to_children[$own_id]-}"
+		local -a children=($children_string)
+
+		local -a leaves=()
+		local -a non_leaves=()
+
+		local child_index
+		for child_index in "${children[@]}"; do
+			local child_own_id
+			child_own_id="$(get_metadata "_id" "$child_index")"
+			if [[ -n "$child_own_id" && -n "${parent_to_children[$child_own_id]+set}" ]]; then
+				non_leaves+=("$child_index")
+			else
+				leaves+=("$child_index")
+			fi
+		done
+
+		for child_index in "${leaves[@]}" "${non_leaves[@]}"; do
+			local child_id
+			child_id="$(get_metadata "_id" "$child_index")"
+
+			local child_is_reference_cluster=false
+			if [[ "$child_id" == *"※"* ]]; then
+				child_is_reference_cluster=true
+			fi
+
+			local child_is_attribute_cluster=false
+			if [[ -z "$child_id" ]] && test_only_has_anonymous_leaves "$child_index"; then
+				child_is_attribute_cluster=true
+			fi
+
+			local child_has_enriching_fields=false
+			local child_position="${metadata_positions[$child_index]:-}"
+			if [[ -n "$child_position" ]]; then
+				local child_start="${child_position%%:*}"
+				local child_length="${child_position#*:}"
+				local j
+				for ((j=0; j<child_length; j++)); do
+					local child_meta="${sources_metadata[child_start + j]}"
+					if [[ "$child_meta" == true:* ]]; then
+						local child_kv="${child_meta#true:}"
+						local child_field="${child_kv%%"="*}"
+						if [[ -n "$child_field" && "$child_field" != "_" && "$child_field" != _* ]]; then
+							child_has_enriching_fields=true
+							break
+						fi
+					fi
+				done
+			fi
+
+			if $exclude_any_non_anonymous_parent_without_children && $child_is_reference_cluster; then
+				if ! $is_reference_cluster && ! $is_dual_root; then
+					continue
+				fi
+			fi
+
+			if $exclude_parent_with_only_anonymous_nodes && $child_is_attribute_cluster && ! $child_has_enriching_fields; then
+				if ! $is_reference_cluster && ! $is_dual_root && ! $is_selected && ! $under_selected && ! $under_reference; then
+					continue
+				fi
+			fi
+
+			local child_type
+			child_type="$(get_metadata "_type" "$child_index")"
+			local parent_type
+			parent_type="$(get_metadata "_type" "$index")"
+
+			_add_to_tree "$child_index" $((current_depth + 1)) "$depth_limit" "$exclude_parent_with_only_anonymous_nodes" "$exclude_any_non_anonymous_parent_without_children" "$select_category" "$child_under_selected" || return 1
+		done
+	fi
+
+	unset in_recursion_path[$index]
+}
+
+print_tree() {
+	local linear_listing="${1:-true}"
+	local show_duplicates="${2:-false}"
+	local align_limit=24
+	local limit_depth_to=-1
+
+	local -A shown=()
+	local hidden_duplicates=false
+
+	generate_tree "$limit_depth_to"
+
+	local tree_index
+	for tree_index in "${tree_order[@]}"; do
+		_print_tree_children "$tree_index" "$linear_listing" "$show_duplicates" "$align_limit" "shown" "hidden_duplicates"
+	done
+
+	if $hidden_duplicates; then
+		 __warn "Some duplicate entries were hidden (only the first occurrence of each source is shown). Set show_duplicates=true to list all duplicates."
+	fi
+}
+
+_print_tree_children() {
+	local index="$1"
+	local linear_listing="$2"
+	local show_duplicates="$3"
+	local align_limit="$4"
+
+	local depth="${entry_depth[$index]:-0}"
+	local indent=""
+	local prefix=""
+
+	if (( depth > 0 )); then
+		indent=$(printf '%*s' $((depth * 8)) '')
+		prefix="${indent}"
+	fi
+
+	local source="${sources_list[$index]}"
+	local key="$index"
+
+	local entry_key
+	entry_key=$(get_entry_key "$key")
+
+	local indices_as_string="${source_to_indices[$entry_key]-}"
+	local -a dup_indices=($indices_as_string)
+	local total_dups=${#dup_indices[@]}
+
+	local dup_number=1
+	local p
+	for ((p=0; p<total_dups; p++)); do
+		if [[ "${dup_indices[$p]}" == "$key" ]]; then
+			dup_number=$((p + 1))
+			break
+		fi
+	done
+
+	local display_id="$entry_key"
+	if (( total_dups > 1 )); then
+		display_id="${entry_key} #${dup_number}/$total_dups"
+	fi
+
+	if [[ "$show_duplicates" != "true" ]]; then
+		if [[ -n "${shown[$entry_key]+set}" ]]; then
+			hidden_duplicates=true
+			return
+		fi
+		shown[$entry_key]=1
+	fi
+
+	__heading "${prefix}${display_id}"
+
+	id="$(get_value "$key" "_id")"
+
+	if [[ "$id" == "" ]] && ! is_attribute_node "$index"; then
+		id="$(sluggify "$source")"
+		$warn_on_ids && __warn "No id found. Suggestion: %s" "# id=$id"
+	fi
+
+	printf "${prefix}${COLOR_GREY1}⁜${COLOR_RESET1} %s${COLOR_RESET1}\n" "$source"
+
+	local position="${metadata_positions[$key]}"
+	local start="${position%%:*}"
+	local length="${position#*:}"
+
+	if (( length == 0 )); then
+		printf "${prefix}${COLOR_GREY1}   └── ${COLOR_RESET1}(no metadata)\n\n"
+		return
+	fi
+
+	printf "${prefix}${COLOR_GREY1}│${COLOR_RESET1}\n"
+
+	local i
+	for ((i=0; i<length; i++)); do
+		local metadata_value="${sources_metadata[start + i]}"
+		local is_data="${metadata_value%%:*}"
+		metadata_value="${metadata_value#*:}"
+		local key="${metadata_value%%=*}"
+		local value="${metadata_value#*=}"
+		local padding
+
+		local connector="├──"
+		if (( i == length - 1 )); then
+			connector="└──"
+		fi
+
+		# Apply indentation to metadata lines too
+		if ! $is_data; then
+			if $linear_listing; then
+				padding=$(get_padding "[TEXT]" "$align_limit")
+				printf "${prefix}${COLOR_GREY1}%s ${COLOR_RESET1}${COLOR_ORANGE1}%s${COLOR_RESET1}%s${COLOR_BLUE1}%s${COLOR_RESET1}\n" "$connector" "[TEXT]" "$padding" "$metadata_value"
+			fi
+
+		elif [[ "$key" == "" ]]; then
+			if $linear_listing; then
+				padding=$(get_padding "[RAW DATA]" "$align_limit")
+				printf "${prefix}${COLOR_GREY1}%s ${COLOR_RESET1}${COLOR_ORANGE1}%s${COLOR_RESET1}%s${COLOR_BLUE1}%s${COLOR_RESET1}\n" "$connector" "[RAW DATA]" "$padding" "$metadata_value"
+			fi
+		else
+
+			if [[ "$key" == "_id" ]]; then
+				 if [[ -z "$value" ]]; then
+					if ! is_attribute_node "$index"; then
+						if $warn_on_ids; then
+							slugged="$(sluggify "$source")"
+							__warn "No id found. Suggestion: %s" "$slugged"
+						fi
+					fi
+				else
+					 slugged="$(sluggify "$value")"
+					 if [[ "$slugged" != "$value" ]]; then
+						 $warn_on_ids && __warn "%s // Suggestion for a slug: %s" "$metadata_value" "$slugged"
+					 fi
+				fi
+				! $__verbose && continue
+			fi
+
+			padding=$(get_padding "$key:" "$align_limit")
+			[[ -z "$value" ]] && value="<none>"
+			printf "${prefix}${COLOR_GREY1}%s ${COLOR_RESET1}${COLOR_BLUE1}%s%s${COLOR_RESET1}${COLOR_PURPLE1}%s${COLOR_RESET1}\n" "$connector" "$key:" "$padding" "$value"
+		fi
+	done
+
+		if ! $linear_listing; then
+			local text="$(get_text "$key")"
+			echo
+			if [[ -n "$text" ]]; then
+				padding=$(get_padding "TEXT SECTION" "$align_limit")
+				printf "${ORANGE}%s${RESET} %s\n" "TEXT SECTION" "$padding"
+				echo -e "${BLUE}$text${RESET}"
+				echo
+			elif $__verbose; then
+				echo -e "${ORANGE}TEXT SECTION: ${RESET}${BLUE}<none>${RESET}"
+			fi
+
+			text="$(get_data "$key")"
+			if [[ -n "$text" ]]; then
+				padding=$(get_padding "DATA SECTION" "$align_limit")
+				printf "${ORANGE}%s${RESET} %s\n" "DATA SECTION" "$padding"
+				echo -e "${BLUE}$text${RESET}"
+				echo
+			elif $__verbose; then
+				echo -e "${ORANGE}DATA SECTION: ${RESET}${BLUE}<none>${RESET}"
+			fi
+		fi
+
+	echo
+}
+
+function key_exists()
+{
+	local key="$1"
+
+	if [[ ! "$key" =~ ^[0-9]+$ ]]; then
+		local indices_as_string="${source_to_indices[$key]:-}"
+		[[ -z "$indices_as_string" ]] && return 1
+
+		local -a indices=($indices_as_string)
+		key=${indices[0]}
+	fi
+
+	local position="${metadata_positions[$key]:-}"
+	if [[ -n "$position" ]]; then
+		return 0
+	fi
+	return 1
+}
+
+function get_data()
+{
+	get_datas "$1" false
+	return $?
+}
+
+function get_datas_as_one(){
+	local key="$1"
+	local prefix="${2:-}"
+	local postfix="${3:-}"
+	local formatter="${4:-echo}"
+	local concatenation_string="${5-" · "}"
+
+	[[ -z "$concatenation_string" ]] && concatenation_string=" $__forbidden_text_processing_marker1 "
+
+	local -a array
+	mapfile -t array < <(get_datas "$key" true)
+
+	if (( ${#array[@]}  == 1 )); then
+		echo "$(printf '%s%s%s' "$prefix" "$("$formatter" "${array[0]}")" "$postfix")"
+		return 0
+	else
+		local compound_string=""
+		if [[ "${5-}" == "" ]]; then
+			compound_string="$concatenation_string"
+		fi
+
+		for single_item in "${array[@]}"; do
+			compound_string+="$(printf '%s%s%s' "$prefix" "$("$formatter" "$single_item")" "$postfix")$concatenation_string"
+		done
+	fi
+
+	echo "${compound_string%"$concatenation_string"}"
+}
+
+function get_datas()
+{
+	local key="$1"
+	local is_multiple_value="${2:-true}"
+
+	if [[ ! "$key" =~ ^[0-9]+$ ]]; then
+		local indices_as_string="${source_to_indices[$key]:-}"
+		[[ -z "$indices_as_string" ]] && return 1
+
+		local -a indices=($indices_as_string)
+		if ! $is_multiple_value; then
+			if (( ${#indices[@]} > 1 )); then
+				echo "Error: duplicate entries exist for source '$key'. Cannot return single value." >&2
+				return 1
+			fi
+		fi
+		key=${indices[0]}
+	fi
+
+	local position="${metadata_positions[$key]:-}"
+	local start="${position%%":"*}"
+	local length="${position#*":"}"
+	local found=false
+	if (( length > 0 )); then
+		local i
+		for ((i=0; i<length; i++)); do
+			local metadata_value="${sources_metadata[start + i]}"
+			local is_data="${metadata_value%%:*}"
+			local value="${metadata_value#*:}"
+			local key1="${value%%"="*}"
+			value="${value#*"="}"
+
+			if $is_data && [[ "$key1" == "" ]]; then
+				if ! $is_multiple_value && $found; then
+					echo "Error: duplicate data for '$key'. Cannot return single value." >&2
+					return 1
+				fi
+				echo "$value"
+				found=true
+			fi
+		done
+	fi
+}
+
+function get_text()
+{
+	get_texts "$1" false
+	return $?
+}
+
+function get_texts_as_one(){
+	local key="$1"
+	local prefix="${2:-}"
+	local postfix="${3:-}"
+	local formatter="${4:-echo}"
+	local concatenation_string="${5-" · "}"
+
+	[[ -z "$concatenation_string" ]] && concatenation_string=" $__forbidden_text_processing_marker1 "
+
+	local -a array
+	mapfile -t array < <(get_texts "$key" true)
+
+	if (( ${#array[@]}  == 1 )); then
+		echo "$(printf '%s%s%s' "$prefix" "$("$formatter" "${array[0]}")" "$postfix")"
+		return 0
+	else
+		local compound_string=""
+		if [[ "${5-}" == "" ]]; then
+			compound_string="$concatenation_string"
+		fi
+
+		for single_item in "${array[@]}"; do
+			compound_string+="$(printf '%s%s%s' "$prefix" "$("$formatter" "$single_item")" "$postfix")$concatenation_string"
+		done
+	fi
+
+	echo "${compound_string%"$concatenation_string"}"
+}
+
+function get_texts()
+{
+	local key="$1"
+	local is_multiple_value="${2:-true}"
+
+	if [[ ! "$key" =~ ^[0-9]+$ ]]; then
+		local indices_as_string="${source_to_indices[$key]:-}"
+		[[ -z "$indices_as_string" ]] && return 1
+		local -a indices=($indices_as_string)
+		if ! $is_multiple_value; then
+			if (( ${#indices[@]} > 1 )); then
+				echo "Error: duplicate entries exist for source '$key'. Cannot return single value." >&2
+				return 1
+			fi
+		fi
+		key=${indices[0]}
+	fi
+
+	local position="${metadata_positions[$key]:-}"
+	local start="${position%%":"*}"
+	local length="${position#*":"}"
+	local found=false
+	if (( length > 0 )); then
+		local i
+		for ((i=0; i<length; i++)); do
+			local metadata_value="${sources_metadata[start + i]}"
+			local is_data="${metadata_value%%:*}"
+			metadata_value="${metadata_value#*:}"
+			if ! $is_data; then
+				if ! $is_multiple_value && $found; then
+					echo "Error: duplicate kv-pair for key '$key'. Cannot return single value." >&2
+					return 1
+				fi
+				echo "$metadata_value"
+				found=true
+			fi
+		done
+	fi
+}
+
+function get_value()
+{
+	get_values "$1" "$2" false
+	return $?
+}
+
+function get_values_as_one(){
+	local key="$1"
+	local entry_name="$2"
+	local prefix="${3:-}"
+	local postfix="${4:-}"
+	local formatter="${5:-echo}"
+	local concatenation_string="${6-" · "}"
+
+	[[ -z "$concatenation_string" ]] && concatenation_string=" $__forbidden_text_processing_marker1 "
+
+	local -a array
+	mapfile -t array < <(get_values "$key" "$entry_name" true)
+
+	if (( ${#array[@]}  == 1 )); then
+		echo "$(printf '%s%s%s' "$prefix" "$("$formatter" "${array[0]}")" "$postfix")"
+		return 0
+	else
+		local compound_string=""
+		if [[ "${6-}" == "" ]]; then
+			compound_string="$concatenation_string"
+		fi
+
+		for single_item in "${array[@]}"; do
+			compound_string+="$(printf '%s%s%s' "$prefix" "$("$formatter" "$single_item")" "$postfix")$concatenation_string"
+		done
+	fi
+
+	echo "${compound_string%"$concatenation_string"}"
+}
+
+function get_values()
+{
+	local key="$1"
+	local entry_name="$2"
+	local is_multiple_value="${3:-true}"
+
+	if [[ ! "$key" =~ ^[0-9]+$ ]]; then
+		local indices_as_string="${source_to_indices[$key]:-}"
+		[[ -z "$indices_as_string" ]] && { return 0; }
+		local -a indices=($indices_as_string)
+
+		if ! $is_multiple_value; then
+			if (( ${#indices[@]} > 1 )); then
+				echo "Error: duplicate entries exist for source '$key'/'$entry_name'. Cannot return single value." >&2
+				return 1
+			fi
+		fi
+		key=${indices[0]}
+	fi
+
+	local position="${metadata_positions[$key]:-}"
+	local start="${position%%":"*}"
+	local length="${position#*":"}"
+	local found=false
+	local last=""
+	if (( length > 0 )); then
+		local i
+		for ((i=0; i<length; i++)); do
+			local metadata_value="${sources_metadata[start + i]}"
+			local is_data="${metadata_value%%:*}"
+			if ! $is_data; then
+				continue
+			fi
+
+			local value="${metadata_value#*:}"
+			local key="${value%%"="*}"
+			value="${value#*"="}"
+
+			if [[ "$key" == "" || "$key" == "$value" ]]; then
+				continue
+			fi
+
+			if [[ "$key" == "$entry_name" ]]; then
+				if ! $is_multiple_value && $found; then
+					echo "Error: duplicate kv-pair for key '$entry_name'. Cannot return single value, last value='$last' next value '$value'." >&2
+					return 1
+				fi
+
+				echo "$value"
+				found=true
+				last="$value"
+			fi
+		done
+	fi
+
+	#! $found && return 1 #@todo
+	#return 0
+}
+
+function get_duplicate_values()
+{
+	local entry_key="$1"
+	local entry_name="$2"
+
+	local indices_as_string="${source_to_indices[$entry_key]:-}"
+	[[ -z "$indices_as_string" ]] && return 1
+	local -a indices=($indices_as_string)
+
+	local index
+	for index in "${indices[@]}"; do
+		local position="${metadata_positions[$index]:-}"
+		local start="${position%%":"*}"
+		local length="${position#*":"}"
+		if (( length > 0 )); then
+			local i
+			for ((i=0; i<length; i++)); do
+				local metadata_value="${sources_metadata[start + i]}"
+				local is_data="${metadata_value%%:*}"
+				if ! $is_data; then
+					continue
+				fi
+				local value="${metadata_value#*:}"
+				local k="${value%%"="*}"
+				value="${value#*"="}"
+				if [[ "$k" == "" || "$k" == "$value" ]]; then
+					continue
+				fi
+				if [[ "$k" == "$entry_name" ]]; then
+					echo "$value"
+				fi
+			done
+		fi
+	done
+}
+
+function get_duplicate_texts()
+{
+	local source="$1"
+
+	local indices_as_string="${source_to_indices[$source]:-}"
+	[[ -z "$indices_as_string" ]] && return
+
+	local -a indices=($indices_as_string)
+
+	local index
+	for index in "${indices[@]}"; do
+		local position="${metadata_positions[$index]:-}"
+		local start="${position%%":"*}"
+		local length="${position#*":"}"
+		if (( length > 0 )); then
+
+			local i
+			for ((i=0; i<length; i++)); do
+				local metadata_value="${sources_metadata[start + i]}"
+				local is_data="${metadata_value%%:*}"
+				metadata_value="${metadata_value#*:}"
+				if ! $is_data; then
+					echo "$metadata_value"
+				fi
+			done
+		fi
+	done
+}
+
+function get_duplicate_data()
+{
+	local source="$1"
+
+	local indices_as_string="${source_to_indices[$source]:-}"
+	[[ -z "$indices_as_string" ]] && return
+
+	local -a indices=($indices_as_string)
+
+	local index
+	for index in "${indices[@]}"; do
+		local position="${metadata_positions[$index]:-}"
+		local start="${position%%":"*}"
+		local length="${position#*":"}"
+		if (( length > 0 )); then
+			local i
+			for ((i=0; i<length; i++)); do
+				local metadata_value="${sources_metadata[start + i]}"
+				local is_data="${metadata_value%%:*}"
+				local value="${metadata_value#*:}"
+				local k="${value%%"="*}"
+				value="${value#*"="}"
+				if $is_data && [[ "$k" == "" ]]; then
+					echo "$value"
+				fi
+			done
+		fi
+	done
+}
+
+get_padding() {
+	local string="$1"
+	local limit="${2:-20}"
+
+	local string_length="${#string}"
+	local padding="$(( limit - string_length ))"
+
+	if (( padding < 2 )); then
+		padding=2
+	fi
+
+	printf '%*s' "$padding" ""
+}
+
+_is_strict_slug() {
+	local string="$1"
+
+	[[ -n "$string" ]] || return 1
+	[[ "$string" == "${string^^}" ]] || return 1
+	[[ "$string" != *" "* ]] || return 1
+	[[ "$string" =~ ^[æÄÖÜäöüßẞa-zA-Z0-9./–—-]+$ ]] || return 1
+
+	if [[ "$string" != "-" ]]; then
+		[[ "$string" == "-"* || "$string" == *"-" ]] && return 1
+		[[ "$string" == "–"* || "$string" == *"–" ]] && return 1
+		[[ "$string" == "—"* || "$string" == *"—" ]] && return 1
+	fi
+	return 0
+}
+
+_is_sluggified() {
+	local string="$1"
+	local left right
+
+	[[ -n "$string" ]] || return 1
+	[[ "$string" != *"※"*"※"* ]] || return 1
+
+	if [[ "$string" == *"※"* ]]; then
+		left="${string%%※*}"
+		right="${string#*※}"
+		[[ -n "$left" && -n "$right" ]] || return 1
+		[[ "$left" != *"※"* && "$right" != *"※"* ]] || return 1
+		_is_strict_slug "$right"
+		return
+	fi
+
+	_is_strict_slug "$string"
+}
+
+_sluggify_text() {
+	local string="$1"
+	string="${string//[[:space:]]/-}"
+	string="${string//[^æÄÖÜäöüßẞa-zA-Z0-9.\/–—-]/-}"
+	while [[ "$string" == *"--"* ]]; do
+		string="${string//--/-}"
+	done
+	string="${string#-}"
+	string="${string%-}"
+	echo "${string}"
+}
+
+sluggify() {
+	local input="$1"
+	local left right
+
+	if [[ "$input" == *"※"* ]]; then
+		left="${input%%※*}"
+		right="${input#*※}"
+		if [[ "$input" == *"※"*"※"* || -z "$left" || -z "$right" ]]; then
+			echo "$input"
+			return
+		fi
+		if [[ "$right" =~ ^https?:// ]]; then
+			right="$(_sluggify_url "$right")"
+		else
+			right="$(_sluggify_text "$right")"
+		fi
+		echo "${left}※${right}"
+		return
+	fi
+
+	if [[ "$input" =~ ^https?:// ]]; then
+		_sluggify_url "$input"
+	else
+		_sluggify_text "$input"
+	fi
+}
+
+_sluggify_url() {
+	local url="$1"
+
+	# Remove protocol
+	local without_protocol="${url#*://}"
+
+	# Extract host and the rest
+	local host="${without_protocol%%/*}"
+	local rest="${without_protocol#*/}"
+
+	# Remove www. from host
+	host="${host#www.}"
+
+	# If no path exists, just return the cleaned host
+	if [[ -z "$rest" || "$rest" == "$without_protocol" ]]; then
+		echo "${host}"
+		return
+	fi
+
+	# Sluggify the path + query + fragment
+	local slug
+	slug="$(_sluggify_text "$rest")"
+
+	echo "${host^^}/$slug"
+}

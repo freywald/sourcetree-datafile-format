@@ -1,0 +1,1461 @@
+#!/bin/bash
+#
+# ex10dead-style Markdown Bibliography
+#
+
+source -- "Build/libraries/build-base" || exit 1
+
+bibliography_language=""
+
+verify_tree() {
+	local return_status=0
+	local status=0
+	verify_ids || status="$?" && (( return_status == 0 )) && return_status="$status"
+	verify_parents_and_references || status="$?" && (( return_status == 0 )) && return_status="$status"
+	verify_types_and_entry_data || status="$?" && (( return_status == 0 )) && return_status="$status"
+	verify_local_paths || status="$?" && (( return_status == 0 )) && return_status="$status"
+	verify_attribute_fields || status="$?" && (( return_status == 0 )) && return_status="$status"
+
+	return 0
+
+	return "$return_status"
+}
+
+verify_ids() {
+	local status=0 key id slugged
+	for key in "${tree_order[@]}"; do
+		id="$(get_metadata "_id" "$key")"
+		[[ -z "$id" ]] && continue
+		slugged="$(sluggify "$id")"
+		if [[ "$slugged" != "$id" ]]; then
+			__warn "_id is not a slug %s; suggestion %s" "$id" "$slugged"
+			status=1
+		fi
+	done
+	return "$status"
+}
+
+verify_parents_and_references() {
+	local status=0 key parent id suffix ancestor walk walk_index found
+	for key in "${tree_order[@]}"; do
+		parent="$(get_metadata "_parent" "$key")"
+		id="$(get_metadata "_id" "$key")"
+		[[ "$id" != *"※"* ]] && continue
+
+		if [[ "$id" == *"※"*"※"* ]]; then
+			__warn "_id has more than one ※: %s" "$id"
+			status=1
+			continue
+		fi
+		suffix="${id#*※}"
+		if [[ -z "${id%%※*}" || -z "$suffix" ]]; then
+			__warn "_id ※ prefix or suffix empty: %s" "$id"
+			status=1
+			continue
+		fi
+		ancestor="$parent"
+		if [[ -z "$ancestor" ]]; then
+			ancestor="${id#*※}"
+		fi
+		if [[ -z "$ancestor" ]]; then
+			__warn "reference _id %s has empty ※ suffix" "$id"
+			status=1
+			continue
+		fi
+		if ! get_entry_index_by_keyvalue "_id" "$ancestor" >/dev/null 2>&1; then
+			__warn "reference _id %s: suffix %s does not name an existing work" "$id" "$ancestor"
+			status=1
+			continue
+		fi
+		found=false
+		walk="$ancestor"
+		while [[ -n "$walk" ]]; do
+			[[ "$walk" == "$suffix" ]] && { found=true; break; }
+			walk_index=""
+			walk_index="$(get_entry_index_by_keyvalue "_id" "$walk")" || walk_index=""
+			[[ -z "$walk_index" ]] && break
+			walk="$(get_metadata "_parent" "$walk_index")"
+		done
+		if ! $found; then
+			__warn "reference _id %s suffix does not match _parent or an ancestor (parent %s)" "$id" "$parent"
+			status=1
+		fi
+
+		if [[ "$id" != *"※"* && "$id" == *"—"* ]]; then
+			if [[ "$id" == *"—"*"—"* ]]; then
+				__warn "_id %s has more than one —; parent not inferred" "$id"
+				status=1
+			else
+				local dash_right="${id#*—}"
+				if [[ -z "$dash_right" || "$id" == "—"* ]]; then
+					__warn "_id %s has an empty side around —" "$id"
+					status=1
+				elif ! get_entry_index_by_keyvalue "_id" "$dash_right" >/dev/null 2>&1; then
+					__warn "_id %s uses — but parent %s does not exist" "$id" "$dash_right"
+					status=1
+				fi
+			fi
+		fi
+	done
+
+	return "$status"
+}
+
+verify_types_and_entry_data() {
+	local status=0 key own_type data_type data_kind entry raw field
+	local -a url_fields=("url" "additional_url" "archive_url" "mirror_url")
+
+	for key in "${tree_order[@]}"; do
+		own_type="$(get_metadata "_type" "$key")"
+		entry="$(get_entry_key "$key")"
+		data_type=""
+		data_kind=""
+
+		if [[ -n "$own_type" ]]; then
+			data_type="${own_type%%:*}"
+			data_kind="${own_type#*:}"
+			[[ "$data_type" == "$data_kind" ]] && data_kind=""
+			[[ -z "$data_type" && -n "$data_kind" ]] && data_type="default"
+
+			case "$data_type" in
+				default|attribute|author|person|book|video|notebook|essay|webpage|url|paper|report|booklet|log|painting|portrait|local|path) ;;
+				*)
+					__warn "unknown _type %s on %s" "$own_type" "$entry"
+					status=1
+					;;
+			esac
+			if [[ -n "$data_kind" ]]; then
+				case "$data_kind" in
+					attribute|isbn|url|local_path|doi) ;;
+					*)
+						__warn "unknown data kind %s on %s" "$own_type" "$entry"
+						status=1
+						;;
+				esac
+				if [[ "$data_kind" != "attribute" && -z "$(get_value "$key" "_")" ]]; then
+					__warn "_type %s on %s has empty entry data" "$own_type" "$entry"
+					status=1
+				fi
+			fi
+		fi
+
+		for field in "${url_fields[@]}"; do
+			while IFS= read -r raw; do
+				[[ -z "$raw" ]] && continue
+				if [[ "$raw" != http://* && "$raw" != https://* ]]; then
+					__warn "%s on %s is not an http(s) url: %s" "$field" "$entry" "$raw"
+					status=1
+				fi
+
+				! warn_if_url_not_beautiful "$raw" && status=1
+			done < <(get_values "$key" "$field" true)
+		done
+
+		if [[ "$data_kind" == "url" ]]; then
+			raw="$(get_value "$key" "_")"
+			if [[ -n "$raw" && "$raw" != http://* && "$raw" != https://* ]]; then
+				__warn "entry data on %s is not an http(s) url: %s" "$entry" "$raw"
+				status=1
+			fi
+		fi
+	done
+	return "$status"
+}
+
+verify_local_paths() {
+	local status=0 key own_type data_kind p path resolved_path
+	for key in "${tree_order[@]}"; do
+		local -a paths=()
+		own_type="$(get_metadata "_type" "$key")"
+		data_kind=""
+		if [[ -n "$own_type" ]]; then
+			data_kind="${own_type#*:}"
+			[[ "$own_type" == "$data_kind" ]] && data_kind=""
+		fi
+		mapfile -t paths < <(get_values "$key" "local_path" true)
+		if [[ "$data_kind" == "local_path" ]]; then
+			p="$(get_value "$key" "_")"
+			[[ -n "$p" ]] && paths+=("$p")
+		fi
+		for path in "${paths[@]}"; do
+			[[ -z "$path" ]] && continue
+			resolved_path="$path"
+			[[ "$path" != /* ]] && resolved_path="$PWD/$path"
+			[[ "$path" == /* ]] && resolved_path="$PWD$path"
+			if [[ ! -e "$resolved_path" && ! -L "$resolved_path" ]]; then
+				__warn "local_path missing for %s: %s" "$(get_entry_key "$key")" "$resolved_path"
+				status=1
+				continue
+			fi
+			if [[ -d "$resolved_path" && ! -L "$resolved_path" ]]; then
+				if [[ -z "$(find "$resolved_path" -maxdepth 1 -mindepth 1 -print -quit)" ]]; then
+					__warn "local_path directory is empty for %s: %s" "$(get_entry_key "$key")" "$resolved_path"
+					status=1
+				fi
+			fi
+
+			__verbose "local_path ok for entry key %s: %s" "$(get_entry_key "$key")" "$resolved_path"
+		done
+	done
+	return "$status"
+}
+
+verify_attribute_fields() {
+	local status=0 key attr
+	for key in "${tree_order[@]}"; do
+		attr="$(get_value "$key" "attribute")"
+		[[ -z "$attr" ]] && continue
+		if ! is_attribute_node "$key"; then
+			__warn "attribute= is only valid on an attribute node (%s)" "$(get_entry_key "$key")"
+			status=1
+		fi
+	done
+	return "$status"
+}
+
+replace_placeholder() {
+	local search="$1"
+	local replacement="$2"
+
+	local content
+	content=$(<"/dev/stdin")
+
+	printf '%s' "${content//"$search"/"$replacement"}"
+}
+
+# shellcheck disable=SC2120
+strip_outer_paragraph() {
+	if (( $# == 0 )); then
+		i="$(cat)"
+	else
+		i="$1"
+	fi
+	local s="$i"
+
+	# Check if it starts with <p and ends with </p>
+	if [[ "$s" == "<p>"* && "$s" == *"</p>" ]]; then
+		# Remove opening <p> or <p attributes>
+		if [[ "$s" == "<p>"* ]]; then
+			s="${s#<p>}"
+		else
+			s="${s#*>}"
+		fi
+
+		s="${s%</p>}"
+
+		# Only accept the result if it does NOT start with another <p
+		if [[ "$s" != "<p>"* ]]; then
+			echo "$s"
+			return 0
+		fi
+	fi
+
+	# If we reach here, either it didn't have outer <p></p>
+	# or it had multiple paragraphs → return original string
+	echo "$i"
+}
+
+# Warns when percent-encoding (or HTML entities) is cosmetic and the line could be stored decoded without changing the resource.
+warn_if_url_not_beautiful() {
+	local url="$1"
+	local label="${2:-$url}"
+
+	[[ -n "$url" ]] || return 0
+
+	if [[ "$url" == *"&amp;"* ]]; then
+		__warn "%s" "url ${label} contains HTML &amp;; store a real URL"
+	fi
+
+	command -v python3 >/dev/null 2>&1 || return 0
+
+	local script="$library_path/url_not_beautiful.py"
+	[[ -f "$script" ]] || return 0
+
+	local reason
+	reason="$(python3 -- "$script" "$url")" || return 0
+	[[ -z "$reason" ]] && return 0
+
+	local line
+	while IFS= read -r line; do
+		[[ -z "$line" ]] && continue
+		__warn "%s" "url ${label} is not stored in decoded form: ${line}"
+	done <<< "$reason"
+
+	return 1
+}
+
+emit_field_if_set() {
+	local field="$1" label="$2" value="$3"
+	[[ -z "$value" ]] && return 0
+	non_standard_citation_format+="${label}: ${value}$__forbidden_text_processing_marker2 "
+	((field_count++))||:
+}
+
+expand_attribute_template() {
+	local tmpl="$1"
+	local name value
+	consumed_in_attribute=()
+	attribute_formatted=""
+	while [[ "$tmpl" =~ \{\{([a-z0-9_]+)\}\} ]]; do
+		name="${BASH_REMATCH[1]}"
+		case "$name" in
+			_) value="$source" ;;
+			author|authors) value="$authors" ;;
+			artist|artists) value="$artists" ;;
+			photographer|photographers) value="$photographers" ;;
+			*) value="$(get_value "$key" "$name")" ;;
+		esac
+		if [[ -z "$value" ]]; then
+			value="<b>?</b>"
+		fi
+		tmpl="${tmpl//\{\{$name\}\}/$value}"
+		consumed_in_attribute+=("$name")
+	done
+	attribute_formatted="$tmpl"
+	attribute_formatted="$(echo "$tmpl" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+}
+
+build_bibliography_ex10dead() {
+	local mode="${1:-0}"
+	local select_category="${2:-""}"
+
+	local exclude_parent_with_only_anonymous_nodes=false
+	local exclude_any_non_anonymous_parent_without_children=false
+
+	# Modes: 0 all fields; 1 no quotation/page/section/timestamp; 2 references keep those, plain title nodes drop the extended block.
+	if (( mode == 0 )); then
+		:
+	elif (( mode == 1 )); then
+		exclude_any_non_anonymous_parent_without_children=true
+	elif (( mode == 2 )); then
+		exclude_parent_with_only_anonymous_nodes=true
+	else
+		__error "invalid mode %s" "$mode"
+	fi
+
+	generate_tree "-1" "$exclude_parent_with_only_anonymous_nodes" "$exclude_any_non_anonymous_parent_without_children" "$select_category"
+	verify_tree
+}
+
+export_bibliography_ex10dead() {
+	local bibliography_title="Literaturverzeichnis"
+	local list_style=true show_duplicates=true show_anonymous_different=false
+	local mode=0 select_category=""
+	bibliography_language="en"
+
+	while (($# > 0)); do
+		case "$1" in
+			--title) bibliography_title="$2"; shift 2 ;;
+			--list-style) list_style=true; shift ;;
+			--no-list-style) list_style=false; shift ;;
+			--show-duplicates) show_duplicates=true; shift ;;
+			--hide-duplicates) show_duplicates=false; shift ;;
+			--show-anonymous-different) show_anonymous_different=true; shift ;;
+			--mode) mode="$2"; shift 2 ;;
+			--select-category) select_category="$2"; shift 2 ;;
+			--language) bibliography_language="$2"; shift 2 ;;
+			*) __error "unknown option %s" "$1"; return 1 ;;
+		esac
+	done
+
+	load_translations "$bibliography_language"
+
+	known_fields=("_" "_id" "_parent" "_heading_prefer_id" "_entry_number" "_type" "_category" "isbn" "doi" "attribute" "quotation" "comment" "contextualization" "artist" "author" "name" "bibliography" "title" "subtitle" "date" "date_taken" "journal" "publisher" "photographer" "location" "citation" "url" "archive_url" "mirror_url" "additional_url" "date_painted" "date_published" "date_last_visited" "local_path" "page" "section" "timestamp" "place" "address" "email" "edition" "editor" "volume" "series" "column" "document_number" "references" "translator" "platform" "duration" "channel" "site" "issue_number" "medium" "collection" "dimensions" "depicted")
+
+		bibliography_title_field_text="$(translate_token "$bibliography_title")"
+		doi_field_text="$(translate_token "DOI")"
+		timestamp_field_text="$(translate_token "Timestamp")"
+		address_field_text="$(translate_token "Address")"
+		page_field_text="$(translate_token "Page")"
+		section_field_text="$(translate_token "Section")"
+		subtitle_field_text="$(translate_token "Subtitle")"
+		platform_field_text="$(translate_token "Platform")"
+		duration_field_text="$(translate_token "Duration")"
+		channel_field_text="$(translate_token "Channel")"
+		site_field_text="$(translate_token "Site")"
+		issue_number_field_text="$(translate_token "Issue number")"
+		medium_field_text="$(translate_token "Medium")"
+		collection_field_text="$(translate_token "Collection")"
+		dimensions_field_text="$(translate_token "Dimensions")"
+		depicted_field_text="$(translate_token "Depicted")"
+		taken_on_field_text="$(translate_token "Taken on")"
+		editor_field_text="$(translate_token "Editor")"
+		last_viewed_field_text="$(translate_token "Last viewed")"
+		place_field_text="$(translate_token "Place")"
+		email_field_text="$(translate_token "Email")"
+		edition_field_text="$(translate_token "Edition")"
+		volume_field_text="$(translate_token "Volume")"
+		series_field_text="$(translate_token "Series")"
+		column_field_text="$(translate_token "Column")"
+		document_number_field_text="$(translate_token "Document number")"
+		references_field_text="$(translate_token "References")"
+		translator_field_text="$(translate_token "Translator")"
+		isbn_field_text="$(translate_token "ISBN")"
+		citation_field_text="$(translate_token "Citation")"
+		date_published_field_text="$(translate_token "Date published")"
+		date_painted_field_text="$(translate_token "Date painted")"
+		date_field_text="$(translate_token "Date")"
+		title_field_text="$(translate_token "Title")"
+		name_field_text="$(translate_token "Name")"
+		author_field_text="$(translate_token "Author")"
+		artist_field_text="$(translate_token "Artist")"
+
+	cat -- "Build/bibliography/templates/document-start.html" | replace_placeholder "{{title}}" "$bibliography_title_field_text" | replace_placeholder "{{base_path}}" "$__script_path/"
+
+	local disable_extended_fields
+
+	local -A shown=()
+	local is_duplicate
+
+	local key
+	for key in "${tree_order[@]}"; do
+		local source="${sources_list[$key]}"
+		local depth="${entry_depth[$key]:-0}"
+		is_duplicate=false
+
+		local disable_extended_fields=false
+		local hide_citation_only_fields=false
+
+		local entry_key
+		entry_key=$(get_entry_key "$key")
+
+		# Data extraction
+		local id parent parent_index
+		id="$(get_metadata "_id" "$key")"
+		parent="$(get_metadata "_parent" "$key")"
+		if [[ -z "$parent" && "$id" == *"※"* && "$id" != *"※"*"※"* ]]; then
+			parent="${id#*※}"
+		fi
+		parent_index="$(parent_index_of "$key")" || parent_index=""
+		if [[ -z "$parent_index" && -n "$parent" ]]; then
+			parent_index="$(get_entry_index_by_keyvalue "_id" "$parent")" || parent_index=""
+		fi
+
+		if (( depth == 0 )) && [[ -n "$parent_index" ]]; then
+			depth=$(( ${entry_depth[$parent_index]:-0} + 1 ))
+		fi
+
+		local indices_str="${source_to_indices[$entry_key]-}"
+		local -a dup_indices=($indices_str)
+		local total_duplicates="${#dup_indices[@]}"
+
+		local dup_number=1
+		for ((p=0; p<total_duplicates; p++)); do
+			if [[ "${dup_indices[$p]}" == "$key" ]]; then
+				dup_number=$((p + 1)) ||:
+				break
+			fi
+		done
+
+		if $show_duplicates; then
+			if [[ -n "${shown["$entry_key"]+set}" ]]; then
+				is_duplicate=true
+			fi
+			shown["$entry_key"]=1
+		fi
+
+		! $show_duplicates && $is_duplicate && __error "duplicate entry $entry_key!"
+
+		local minimal
+		local own_type
+		own_type="$(get_metadata "_type" "$key")"
+		if [[ -z "$own_type" ]]; then
+			minimal=true
+		else
+			minimal=false
+		fi
+
+		local anonymous
+		anonymous="$(get_value "$key" "_anonymous")"
+		local type
+		type="$(resolved_type "$key")" || type=""
+
+		local heading_prefer_id
+		heading_prefer_id="$(get_value "$key" "_heading_prefer_id")"
+		local is_selected=false
+		if [[ -n "$select_category" ]]; then
+			local category_now
+			category_now="$(get_metadata "_category" "$key")"
+			[[ "$category_now" == "$select_category" ]] && is_selected=true
+		fi
+
+		local is_leave=false
+		if [[ "$id" == *"※"* ]]; then
+			is_leave=true
+		fi
+
+		local parent_type=""
+		if [[ -n "$parent" ]]; then
+			parent_type="$(resolved_type "$key")" || parent_type=""
+			local parent_source
+
+			parent_source="$(get_value "$parent_index" "_")"
+			if [[ -n "$type" && "$parent_type" == "$type" && "$source" == "$parent_source" ]]; then
+				is_leave=true
+			fi
+		fi
+		local entry_number
+		entry_number="$(get_value "$key" "_entry_number")"
+
+		# single-value data
+		local title
+		title="$(get_value "$key" "title")"
+		local subtitle
+		subtitle="$(get_value "$key" "subtitle")"
+		local date
+		date="$(get_value "$key" "date")"
+		local date_taken
+		date_taken="$(get_value "$key" "date_taken")"
+		local date_painted
+		date_painted="$(get_value "$key" "date_painted")"
+		local date_published
+		date_published="$(get_value "$key" "date_published")"
+		local isbn
+		isbn="$(get_value "$key" "isbn")"
+		local doi
+		doi="$(get_value "$key" "doi")"
+		local location
+		location="$(get_value "$key" "location")"
+		local citation
+		citation="$(get_value "$key" "citation")"
+		local email
+		email="$(get_value "$key" "email")"
+		local place
+		place="$(get_value "$key" "place")"
+		local edition
+		edition="$(get_value "$key" "edition")"
+		local editor
+		editor="$(get_value "$key" "editor")"
+		local volume
+		volume="$(get_value "$key" "volume")"
+		local series
+		series="$(get_value "$key" "series")"
+		local column
+		column="$(get_value "$key" "column")"
+		local document_number
+		document_number="$(get_value "$key" "document_number")"
+		local references
+		references="$(get_value "$key" "references")"
+		local translator
+		translator="$(get_value "$key" "translator")"
+		local platform
+		platform="$(get_value "$key" "platform")"
+		local duration
+		duration="$(get_value "$key" "duration")"
+		local channel
+		channel="$(get_value "$key" "channel")"
+		local address
+		address="$(get_value "$key" "address")"
+		local site
+		site="$(get_value "$key" "site")"
+		local issue_number
+		issue_number="$(get_value "$key" "issue_number")"
+		local medium
+		medium="$(get_value "$key" "medium")"
+		local collection
+		collection="$(get_value "$key" "collection")"
+		local dimensions
+		dimensions="$(get_value "$key" "dimensions")"
+		local depicted
+		depicted="$(get_value "$key" "depicted")"
+		local attribute
+		attribute="$(get_value "$key" "attribute")"
+		local journal
+		journal="$(get_value "$key" "journal")"
+		local publisher
+		publisher="$(get_value "$key" "publisher")"
+		local date_last_visited
+		date_last_visited="$(get_value "$key" "date_last_visited")"
+		local quotation
+		quotation="$(get_value "$key" "quotation" | __decode_multiline)"
+		quotation="${quotation//$'\n'/"<br>"}"
+
+		# multi-value data
+		local page
+		page="$(get_values_as_one "$key" "page" "" "" "" "")"
+		local section
+		section="$(get_values_as_one "$key" "section" "" "" "" "")"
+		local timestamp
+		timestamp="$(get_values_as_one "$key" "timestamp" "" "" "" "")"
+		local local_path
+		local_path="$(get_values_as_one "$key" "local_path" "<i>" "</i>" "" "")"
+		local url
+		url="$(get_values_as_one "$key" "url" "<i>" "</i>" "" "")"
+		local mirror_url
+		mirror_url="$(get_values_as_one "$key" "mirror_url" "<i>" "</i>" "" "")"
+		local additional_url
+		additional_url="$(get_values_as_one "$key" "additional_url" "<i>" "</i>" "" "")"
+		local archive_url
+		archive_url="$(get_values_as_one "$key" "archive_url" "<i>" "</i>" "" "")"
+		local authors
+		authors="$(get_values_as_one "$key" "author" "" "" "" " · ")"
+		local names
+		names="$(get_values_as_one "$key" "name" "" "" "" " · ")"
+		local artists
+		artists="$(get_values_as_one "$key" "artist" "" "" "" " · ")"
+		local comment
+		comment="$(get_values_as_one "$key" "comment" "( " " )" "" "$__forbidden_text_processing_marker2 ")"
+		local contextualization
+		contextualization="$(get_values_as_one "$key" "contextualization" "" "" "" "$__forbidden_text_processing_marker2 ")"
+		local bibliography
+		bibliography="$(get_values_as_one "$key" "bibliography" "" "" "" "$__forbidden_text_processing_marker2 ")"
+		local photographers
+		photographers="$(get_values_as_one "$key" "photographer" "" "" "" " · ")"
+
+		local fixed_citation=""
+		local non_standard_citation_format=""
+		local hide_field_if_minimal=""
+
+		if [[ "$heading_prefer_id" == "" || "$heading_prefer_id" == "true" ]]; then
+			heading_prefer_id=true
+		else
+			heading_prefer_id=false
+		fi
+
+		if [[ "$anonymous" == "true" ]]; then
+			anonymous=true
+		else
+			anonymous=false
+		fi
+
+		if [[ -z "$type" ]]; then
+			minimal=true
+		fi
+
+		local under_selected_category=false
+		if [[ -n "$select_category" ]]; then
+			local walk="$parent"
+			while [[ -n "$walk" ]]; do
+				local walk_index=""
+				walk_index="$(get_entry_index_by_keyvalue "_id" "$walk")" || walk_index=""
+				[[ -z "$walk_index" ]] && break
+				if [[ "$(get_metadata "_category" "$walk_index")" == "$select_category" ]]; then
+					under_selected_category=true
+					break
+				fi
+				walk="$(get_metadata "_parent" "$walk_index")"
+			done
+		fi
+
+		if [[ "$mode" == "1" ]]; then
+			hide_citation_only_fields=true
+		elif [[ "$mode" == "2" ]]; then
+			if ! is_dual_root_node "$key" "$depth" \
+				&& [[ "$id" != *"※"* ]] \
+				&& ! is_attribute_under_reference "$key" \
+				&& ! $is_selected \
+				&& ! $under_selected_category; then
+				disable_extended_fields=true
+			fi
+		fi
+
+		local resolved_parent="$parent"
+
+		local child_enriches_parent=true
+		if [[ -n "$parent" ]]; then
+			local parent_source
+			parent_source="$(get_value "$parent_index" "_")"
+
+			if [[ -n "$type" && "$parent_type" != "$type" ]]; then
+				child_enriches_parent=false
+			fi
+
+			if [[ -n "$source" && "$parent_source" != "$source" ]]; then
+				child_enriches_parent=false
+			fi
+
+			if $minimal; then
+				type="$parent_type"
+			fi
+
+			local parent_title
+			parent_title="$(get_value "$parent_index" "title")"
+			if [[ -n "$title" && "$parent_title" != "$title" ]]; then
+				minimal=false
+			fi
+
+			if [[ -n "$parent_index" ]] && ! has_metadata "attribute" "$key"; then
+				[[ -z "$authors" ]] && authors="$(get_values_as_one "$parent_index" "author" "" "" "" " · ")"
+				[[ -z "$title" ]] && title="$(get_value "$parent_index" "title")"
+				[[ -z "$date" ]] && date="$(get_value "$parent_index" "date")"
+			fi
+
+			anonymous=true
+			$show_anonymous_different && [[ $id != "" ]] && anonymous=false
+		else
+			resolved_parent="$id"
+			anonymous=false
+		fi
+
+		if has_metadata "attribute" "$key";then
+			type="$(get_value "$key" "_type")"
+		fi
+
+		local data_kind=""
+		if [[ -n "$type" ]]; then
+			data_kind="${type#*":"}"
+			type="${type%%":"*}"
+			if [[ "$type" == "$data_kind" ]]; then
+				data_kind=""
+			fi
+		fi
+
+		if [[ -z "$type" ]];then
+			type="default"
+		fi
+
+		icon=""; icon_font=""
+		icon_book='<span class="icon1">🕮</span>'
+		icon_video='<span>🎞</span>'
+		icon_essay='<span class="icon2">📰︎</span>'
+		icon_portrait='<span>📷︎</span>'
+		icon_painting='<span>🎨︎</span>'
+		icon_author='<span>🖋</span>'
+		icon_person='<span class="icon3">👤︎</span>'
+		icon_link='<span>⤻</span>' #📋📄
+
+		case "$type" in
+			author)
+				[[ -z "$icon" ]] && icon="$icon_author"
+				[[ -z "$icon_font" ]] && icon_font="SegoeUISymbol"
+				;&
+			person)
+				[[ -z "$data_kind" ]] && data_kind="name"
+				[[ -z "$names" ]] && names="$(get_value "$key" "_")"
+				[[ -z "$icon" ]] && icon="$icon_person"
+				[[ -z "$icon_font" ]] && icon_font="SegoeUISymbol"
+				;;
+			book)
+				[[ -z "$data_kind" ]] && data_kind="title"
+				[[ -z "$title" ]] && title="$(get_value "$key" "_")"
+				[[ -z "$icon" ]] && icon="$icon_book"
+				[[ -z "$icon_font" ]] && icon_font="SegoeUISymbol"
+				;;
+			video)
+				[[ -z "$data_kind" ]] && data_kind="title"
+				[[ -z "$title" ]] && title="$(get_value "$key" "_")"
+				[[ -z "$icon" ]] && icon="$icon_video"
+				[[ -z "$icon_font" ]] && icon_font="EmojiOne"
+				;;
+			paper)
+				[[ -z "$data_kind" ]] && data_kind="title"
+				[[ -z "$title" ]] && title="$(get_value "$key" "_")"
+				[[ -z "$icon" ]] && icon="$icon_essay"
+				[[ -z "$icon_font" ]] && icon_font="EmojiOne"
+				;;
+			notebook|essay|webpage)
+				[[ -z "$data_kind" ]] && data_kind="title"
+				[[ -z "$title" ]] && title="$(get_value "$key" "_")"
+				[[ -z "$icon" ]] && icon="$icon_essay"
+				[[ -z "$icon_font" ]] && icon_font="EmojiOne"
+				;;
+			painting)
+				[[ -z "$data_kind" ]] && data_kind="title"
+				[[ -z "$title" ]] && title="$(get_value "$key" "_")"
+				[[ -z "$icon" ]] && icon="$icon_painting"
+				[[ -z "$icon_font" ]] && icon_font="EmojiOne"
+				;;
+			portrait)
+				[[ -z "$data_kind" ]] && data_kind="title"
+				[[ -z "$title" ]] && title="$(get_value "$key" "_")"
+				[[ -z "$icon" ]] && icon="$icon_portrait"
+				[[ -z "$icon_font" ]] && icon_font="EmojiOne"
+				;;
+			default)
+				;;
+			*)
+				icon="<span class=\"invalid\">?</span>"; icon_font="SegoeUISymbol"
+				;;
+		esac
+
+		if has_metadata "attribute" "$key" && [[ -z "$type" ]];then
+			data_kind="attribute"
+		fi
+
+		# by data kind
+		if [[ "$data_kind" == "attribute" ]]; then
+			:
+		elif [[ "$data_kind" == "title" ]]; then
+			[[ -z "$title" && "$key" != "$entry_key" ]] && title="$source"
+			[[ -n "$title" && "$id" != "$entry_key" ]] && ! $anonymous && hide_field_if_minimal="$data_kind"
+		elif [[ "$data_kind" == "name" ]]; then
+			[[ -z "$names" && "$key" != "$entry_key" ]] && names="$source"
+			[[ -n "$names" && "$id" != "$entry_key" ]] && ! $anonymous && hide_field_if_minimal="$data_kind"
+		elif [[ "$data_kind" == "isbn" ]]; then
+			[[ -z "$isbn" && "$key" != "$entry_key" ]] && isbn="$source"
+			[[ -n "$isbn" && "$id" != "$entry_key" ]] && ! $anonymous && hide_field_if_minimal="$data_kind"
+		elif [[ "$data_kind" == "doi" ]]; then
+			[[ -z "$doi" && "$key" != "$entry_key" ]] && doi="$source"
+			[[ -n "$doi" && "$id" != "$entry_key" ]] && ! $anonymous && hide_field_if_minimal="$data_kind"
+		elif [[ "$data_kind" == "url" ]]; then
+			[[ -z "$url" && "$key" != "$entry_key" ]] && url="$(get_values_as_one "$key" "_" "" "" "" "")"
+			[[ -n "$url" && "$id" != "$entry_key" ]] && ! $anonymous && hide_field_if_minimal="$data_kind"
+		elif [[ "$data_kind" == "local_path" ]]; then
+			[[ -z "$local_path" && "$key" != "$entry_key" ]] && local_path="$source"
+			[[ -n "$local_path" && "$id" != "$entry_key" ]] && ! $anonymous && hide_field_if_minimal="$data_kind"
+		elif [[ -n "$data_kind" ]]; then
+			__error "unknown kind %s" "$data_kind"
+		fi
+
+		if has_metadata "attribute" "$key" && [[ -n "$data_kind" ]]; then
+			hide_field_if_minimal="$data_kind"
+		fi
+
+		local show_only_field=""
+		$is_leave && $child_enriches_parent && hide_field_if_minimal="$data_kind"
+		! $is_leave && { show_only_field="$data_kind"; hide_field_if_minimal=""; }
+
+		url_field_text="$(translate_token "Internet link")"
+		[[ "$url" == *"$__forbidden_text_processing_marker1"* ]] && url_field_text="$(translate_token "Internet links")"
+		photographer_field_text="$(translate_token "Photographer")"
+		[[ "$photographers" == *"$__forbidden_text_processing_marker1"* ]] && photographer_field_text="$(translate_token "Photographers")"
+		publisher_field_text="$(translate_token "Publisher")"
+		[[ "$publisher" == *"$__forbidden_text_processing_marker1"* ]] && publisher_field_text="$(translate_token "Publishers")"
+		location_field_text="$(translate_token "Location")"
+		[[ "$location" == *"$__forbidden_text_processing_marker1"* ]] && location_field_text="$(translate_token "Locations")"
+		journal_field_text="$(translate_token "Journal")"
+		[[ "$journal" == *"$__forbidden_text_processing_marker1"* ]] && journal_field_text="$(translate_token "Journals")"
+		additional_url_field_text="$(translate_token "Additional internet link")"
+		[[ "$additional_url" == *"$__forbidden_text_processing_marker1"* ]] && additional_url_field_text="$(translate_token "Additional internet links")"
+		mirror_url_field_text="$(translate_token "Mirror internet link")"
+		[[ "$mirror_url" == *"$__forbidden_text_processing_marker1"* ]] && mirror_url_field_text="$(translate_token "Mirror internet links")"
+		archive_url_field_text="$(translate_token "Archive internet link")"
+		[[ "$archive_url" == *"$__forbidden_text_processing_marker1"* ]] && archive_url_field_text="$(translate_token "Archive internet links")"
+		local_path_field_text="$(translate_token "Local path")"
+		[[ "$local_path" == *"$__forbidden_text_processing_marker1"* ]] && local_path_field_text="$(translate_token "Local paths")"
+
+		local list_style_separator='<br>'
+		local inner_list_style_separator='<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;-&nbsp;&nbsp; '
+
+		local title_formatted=""
+		local names_formatted=""
+		local authors_formatted=""
+		local bibliography_formatted=""
+
+		local date_formatted=""
+		[[ -n "$date" ]] && date_formatted="(${date})"
+
+		local attribute_formatted=""
+		if has_metadata "attribute" "$key"; then
+			expand_attribute_template "$attribute"
+			local consumed
+			for consumed in "${consumed_in_attribute[@]}"; do
+				[[ "$consumed" == "author" || "$consumed" == "authors" ]] && consumed="author"
+				[[ "$consumed" == "name" || "$consumed" == "names" ]] && consumed="name"
+				[[ "$consumed" == "artist" || "$consumed" == "artists" ]] && consumed="artist"
+				[[ "$consumed" == "photographer" || "$consumed" == "photographers" ]] && consumed="photographer"
+
+				local field
+				for field in "${known_fields[@]}"; do
+					[[ "$field" == "_"* || "$field" == "attribute" ]] && continue
+					[[ "$field" == "$consumed" ]] || continue
+					#echo "RESET: $field for $entry_key" >&2
+					case "$field" in
+						author) authors="" ;;
+						name) names=""	;;
+						artist) artists="" ;;
+						photographer) photographers="" ;;
+						*) printf -v "$field" '%s' "" ;;
+					esac
+				done
+			done
+
+			minimal=false
+			fixed_citation=""
+			if [[ -n "$attribute_formatted" ]]; then
+				if is_attribute_node "$key" && [[ "$type" == "default" && -z "$data_kind" ]]; then
+					fixed_citation="<span class=\"attribute-node-symbol\">⋅</span><span class=\"attribute-node-text\">$attribute_formatted $list_style_separator"
+				else
+					fixed_citation="$attribute_formatted $list_style_separator"
+				fi
+			fi
+		fi
+
+		local f
+		readarray -t f < <(filter_metadata_collection "$key" "${known_fields[@]}")
+		local key1
+		for key1 in "${f[@]}"; do
+			local skip=false
+			if has_metadata "attribute" "$key" && [[ "$key1" != "_"* ]]; then
+				local consumed
+				for consumed in "${consumed_in_attribute[@]}"; do
+					#echo "CONSUMED: $consumed for $entry_key" >&2
+					[[ "$consumed" == "$key1" ]] && skip=true
+				done
+			fi
+			$skip && continue
+			echo "<span class=\"invalid\">UNKNOWN KEY: $key1</span>"
+			echo "<span class=\"invalid\">UNKNOWN KEY: $key1</span>" >&2
+		done
+
+		case "$type" in
+			author)
+				;&
+			person)
+				if ! $minimal && [[ -z "$fixed_citation" ]]; then
+					if has_metadata "attribute" "$key"; then
+						fixed_citation="$attribute_formatted"
+					elif [[ -n "$names" ]]; then
+						if $disable_extended_fields; then
+							#if (( depth > 0 )); then
+							#	names_formatted="$(echo "$names" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+							#	fixed_citation="$names_formatted"
+							#else
+								fixed_citation=""
+							#fi
+						else
+							if [[ -n "$bibliography" ]]; then
+								bibliography="${bibliography//"$__forbidden_text_processing_marker2 "/"$list_style_separator"}"
+								bibliography="${bibliography//" $__forbidden_text_processing_marker1 "/"$inner_list_style_separator"}"
+								bibliography_formatted="$(echo "$bibliography" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+								names_formatted="$(echo "$names" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+								#if (( depth > 0 )); then
+								# fixed_citation="$names_formatted zz $__forbidden_text_processing_marker2 $bibliography_formatted"
+								fixed_citation="$bibliography_formatted"
+								bibliography=""
+							else
+								names_formatted="$(echo "$names" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+								fixed_citation="$names_formatted"
+								names=""
+							fi
+						fi
+					else
+						__warn "default entry attributes by type %s not set id: %s parent: $parent" "$type" "[$id] $entry_key" "$parent"
+						fixed_citation="<span class=\"invalid\">invalid</span>"
+					fi
+				fi
+				;;
+			book)
+				if ! $minimal && [[ -z "$fixed_citation" ]]; then
+					if has_metadata "attribute" "$key"; then
+						fixed_citation="$attribute_formatted"
+					elif [[ -n "$authors" && -n "$title" ]]; then
+						[[ -z "$date" && -n "$date_published" ]] && date_formatted="(${date_published})"
+						authors_formatted="$(echo "$authors" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+						title_formatted="$(echo "$title" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+						fixed_citation="${authors_formatted} – <i>${title_formatted}</i> ${date_formatted}"
+					elif [[ -z "$authors" && -n "$title" ]]; then
+						[[ -z "$date" && -n "$date_published" ]] && date_formatted="(${date_published})"
+						title_formatted="$(echo "$title" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+					   fixed_citation="<i>${title_formatted}</i> ${date_formatted}"
+					else
+						__warn "default entry attributes by type %s not set id: %s parent: $parent" "$type" "[$id] $entry_key" "$parent"
+						fixed_citation="<span class=\"invalid\">invalid</span>"
+					fi
+				fi
+				;;
+			video)
+				if ! $minimal && [[ -z "$fixed_citation" ]]; then
+					if has_metadata "attribute" "$key"; then
+						fixed_citation="$attribute_formatted"
+					elif [[ -n "$authors" && -n "$title" ]];  then
+						[[ -z "$date" && -n "$date_published" ]] && date_formatted="(${date_published})"
+						authors_formatted="$(echo "$authors" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+						title_formatted="$(echo "$title" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+						fixed_citation="${authors_formatted} – <i>${title_formatted}</i> ${date_formatted}"
+					elif [[ -z "$authors" && -n "$title" ]]; then
+						[[ -z "$date" && -n "$date_published" ]] && date_formatted="(${date_published})"
+						title_formatted="$(echo "$title" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+						fixed_citation="<i>${title_formatted}</i> ${date_formatted}"
+					else
+						__warn "default entry attributes by type %s not set id: %s parent: $parent" "$type" "[$id] $entry_key" "$parent"
+						fixed_citation="<span class=\"invalid\">invalid</span>"
+					fi
+				fi
+				;;
+			paper)
+				if ! $minimal && [[ -z "$fixed_citation" ]]; then
+					if has_metadata "attribute" "$key"; then
+						fixed_citation="$attribute_formatted"
+					elif [[ -n "$authors" && -n "$title" ]]; then
+						[[ -z "$date" && -n "$date_published" ]] && date_formatted="(${date_published})"
+						authors_formatted="$(echo "$authors" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+						title_formatted="$(echo "$title" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+						fixed_citation="${authors_formatted} – <i>${title_formatted}</i> ${date_formatted}"
+					elif [[ -z "$authors" && -n "$title" ]]; then
+						[[ -z "$date" && -n "$date_published" ]] && date_formatted="(${date_published})"
+						title_formatted="$(echo "$title" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+					   fixed_citation="<i>${title_formatted}</i> ${date_formatted}"
+					else
+						__warn "default entry attributes by type %s not set id: %s parent: $parent" "$type" "[$id] $entry_key" "$parent"
+						fixed_citation="<span class=\"invalid\">invalid</span>"
+					fi
+				fi
+				;;
+			notebook|essay|webpage)
+				if ! $minimal && [[ -z "$fixed_citation" ]]; then
+					if has_metadata "attribute" "$key"; then
+						fixed_citation="$attribute_formatted"
+					elif [[ -n "$authors" && -n "$title" ]]; then
+						[[ -z "$date" && -n "$date_published" ]] && date_formatted="(${date_published})"
+						authors_formatted="$(echo "$authors" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+						title_formatted="$(echo "$title" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+						fixed_citation="${authors_formatted} – <i>${title_formatted}</i> ${date_formatted}"
+					elif [[ -z "$authors" && -n "$title" ]]; then
+						[[ -z "$date" && -n "$date_published" ]] && date_formatted="(${date_published})"
+						title_formatted="$(echo "$title" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+					   fixed_citation="<i>${title_formatted}</i> ${date_formatted}"
+					else
+						__warn "default entry attributes by type %s not set id: %s parent: $parent" "$type" "[$id] $entry_key" "$parent"
+						fixed_citation="<span class=\"invalid\">invalid</span>"
+					fi
+				fi
+				;;
+			painting)
+				if ! $minimal && [[ -z "$fixed_citation" ]]; then
+					if has_metadata "attribute" "$key"; then
+						fixed_citation="$attribute_formatted"
+					elif [[ -n "$artists" && -n "$title" ]]; then
+						[[ -z "$date" && -n "$date_published" ]] && date_formatted="(${date_published})"
+						title_formatted="$(echo "$title" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+						fixed_citation="${artists} – <i>${title_formatted}</i> ${date_formatted}"
+					else
+						__warn "default entry attributes by type %s not set id: %s parent: $parent" "$type" "[$id] $entry_key" "$parent"
+						fixed_citation="<span class=\"invalid\">invalid</span>"
+					fi
+				fi
+				;;
+			portrait)
+				if ! $minimal && [[ -z "$fixed_citation" ]]; then
+					if has_metadata "attribute" "$key"; then
+						fixed_citation="$attribute_formatted"
+					elif [[ -n "$title" ]]; then
+						title_formatted="$(echo "$title" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+						fixed_citation="${title_formatted}"
+					else
+						__warn "default entry attributes by type %s not set id: %s parent: $parent" "$type" "[$id] $entry_key" "$parent"
+						fixed_citation="<span class=\"invalid\">invalid</span>"
+					fi
+				fi
+				;;
+			attribute)
+				if ! $minimal && [[ -z "$fixed_citation" ]]; then
+					if has_metadata "attribute" "$key"; then
+						fixed_citation="$attribute_formatted"
+					else
+						fixed_citation=""
+					fi
+				fi
+				;;
+
+			default)
+				if ! $minimal && [[ -z "$fixed_citation" ]]; then
+					if has_metadata "attribute" "$key"; then
+						fixed_citation="$attribute_formatted"
+					else
+						fixed_citation=""
+					fi
+				fi
+				;;
+
+			*)
+				fixed_citation="<span class=\"invalid\">invalid</span>"
+				;;
+		esac
+
+		if [[ "$data_kind" == "attribute" ]]; then
+			heading_prefer_id=false
+		fi
+
+		if is_attribute_node "$key" && [[ -z "$fixed_citation" ]]; then
+			if has_metadata "attribute" "$key" && [[ -n "$attribute_formatted" ]]; then
+				fixed_citation="$attribute_formatted"
+			else
+				fixed_citation=""
+				if [[ "$type" != "attribute" ]]; then
+					fixed_citation="$source"
+				fi
+			fi
+		fi
+
+		if [[ -z "$own_type" ]] && [[ "$id" != *"※"* ]] && [[ -n "$parent" ]] && ! is_dual_root_node "$key" "$depth"; then
+			icon=""; icon_font=""
+		fi
+
+		if [[ "$id" == *"※"* ]]; then
+			icon="$icon_link"; icon_font="SegoeUISymbol"
+			icon=""; icon_font=""
+		fi
+
+		local field_count=0
+
+		wrap_data_kind() {
+			local field_text="$1" kind="$2" text="$3"
+			if [[ "$data_kind" == "$kind" && -n "$text" ]]; then
+				printf '<span class="data-kind">%s: %s</span>' "$field_text" "$text"
+			else
+				printf '%s: %s' "$field_text" "$text"
+			fi
+		}
+
+		if ! has_metadata "attribute" "$key"; then
+			if [[ -n "$isbn" ]] && ( ( ! $disable_extended_fields && [[ $hide_field_if_minimal != "isbn" ]]) || ( $disable_extended_fields && [[ $show_only_field == "isbn" ]]) ); then
+				non_standard_citation_format+="$(wrap_data_kind "$isbn_field_text" "isbn" "$isbn")$__forbidden_text_processing_marker2 "
+				((field_count++))||:
+				isbn=""
+			fi
+			if [[ -n "$url" ]] && ( ( ! $disable_extended_fields && [[ $hide_field_if_minimal != "url" ]]) || ( $disable_extended_fields && [[ $show_only_field == "url" ]]) ); then
+				non_standard_citation_format+="$(wrap_data_kind "$url_field_text" "url" "$url")$__forbidden_text_processing_marker2 "
+				((field_count++))||:
+				url=""
+			fi
+			if [[ -n "$local_path" ]] && ( ( ! $disable_extended_fields && [[ $hide_field_if_minimal != "local_path" ]]) || ( $disable_extended_fields && [[ $show_only_field == "local_path"  ]]) ); then
+				non_standard_citation_format+="$(wrap_data_kind "$local_path_field_text" "local_path" "$local_path")$__forbidden_text_processing_marker2 "
+				((field_count++))||:
+				local_path=""
+			fi
+			if [[ -n "$doi" ]] && ( ( ! $disable_extended_fields && [[ $hide_field_if_minimal != "doi" ]]) || ( $disable_extended_fields && [[ $show_only_field == "doi" ]]) ); then
+				non_standard_citation_format+="$(wrap_data_kind "$doi_field_text" "doi" "$doi")$__forbidden_text_processing_marker2 "
+				((field_count++))||:
+				doi=""
+			fi
+		fi
+
+		local quotation_formatted=""
+		[[ -n "$quotation" ]] && quotation_formatted="$(echo "**‹‹** $quotation **››**" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+		[[ -z "$bibliography_formatted" ]] && bibliography_formatted="$(echo "$bibliography" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+		[[ -z "$names_formatted" ]] && names_formatted="$(echo "$names" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+		[[ -z "$authors_formatted" ]] && authors_formatted="$(echo "$authors" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+		[[ -z "$title_formatted" ]] && title_formatted="$(echo "$title" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+
+		if has_metadata "attribute" "$key" && ! $disable_extended_fields; then
+			local field consumed skip metadata_entry kv
+			local -A emitted_leftover=()
+			while IFS= read -r metadata_entry; do
+				[[ "$metadata_entry" == true:* ]] || continue
+				kv="${metadata_entry#true:}"
+				field="${kv%%=*}"
+
+				[[ "$field" == _* || "$field" == "attribute" ]] && continue
+				[[ "$field" == "$hide_field_if_minimal" ]] && continue
+				[[ -n "${emitted_leftover[$field]+set}" ]] && continue
+
+				skip=false
+				for consumed in "${consumed_in_attribute[@]}"; do
+					[[ "$consumed" == "author" || "$consumed" == "authors" ]] && consumed="author"
+					[[ "$consumed" == "name" || "$consumed" == "names" ]] && consumed="name"
+					[[ "$consumed" == "artist" || "$consumed" == "artists" ]] && consumed="artist"
+					[[ "$consumed" == "photographer" || "$consumed" == "photographers" ]] && consumed="photographer"
+					[[ "$field" == "$consumed" ]] && skip=true
+				done
+				$skip && continue
+
+				emitted_leftover["$field"]=1
+
+				case "$field" in
+					author) emit_field_if_set "$field" "$author_field_text" "$authors_formatted" ;;
+					artist) emit_field_if_set "$field" "$artist_field_text" "$artists" ;;
+					photographer) emit_field_if_set "$field" "$photographer_field_text" "$photographers" ;;
+					name) emit_field_if_set "$field" "$name_field_text" "$names" ;;
+					address) emit_field_if_set "$field" "$address_field_text" "$address" ;;
+					title) emit_field_if_set "$field" "$title_field_text" "$title_formatted" ;;
+					subtitle) emit_field_if_set "$field" "$subtitle_field_text" "$subtitle" ;;
+					date) emit_field_if_set "$field" "$date_field_text" "$date" ;;
+					date_taken) emit_field_if_set "$field" "$taken_on_field_text" "$date_taken" ;;
+					date_painted) emit_field_if_set "$field" "$date_painted_field_text" "$date_painted" ;;
+					date_published) emit_field_if_set "$field" "$date_published_field_text" "$date_published" ;;
+					date_last_visited) emit_field_if_set "$field" "$last_viewed_field_text" "$date_last_visited" ;;
+					location) emit_field_if_set "$field" "$location_field_text" "$location" ;;
+					citation) emit_field_if_set "$field" "$citation_field_text" "$citation" ;;
+					journal) emit_field_if_set "$field" "$journal_field_text" "$journal" ;;
+					publisher) emit_field_if_set "$field" "$publisher_field_text" "$publisher" ;;
+					url) emit_field_if_set "$field" "$url_field_text" "$url" ;;
+					additional_url) emit_field_if_set "$field" "$additional_url_field_text" "$additional_url" ;;
+					mirror_url) emit_field_if_set "$field" "$mirror_url_field_text" "$mirror_url" ;;
+					archive_url) emit_field_if_set "$field" "$archive_url_field_text" "$archive_url" ;;
+					local_path) emit_field_if_set "$field" "$local_path_field_text" "$local_path" ;;
+					isbn) emit_field_if_set "$field" "$isbn_field_text" "$isbn" ;;
+					doi) emit_field_if_set "$field" "$doi_field_text" "$doi" ;;
+					page) emit_field_if_set "$field" "$page_field_text" "$page" ;;
+					section) emit_field_if_set "$field" "$section_field_text" "$section" ;;
+					timestamp) emit_field_if_set "$field" "$timestamp_field_text" "$timestamp" ;;
+					place) emit_field_if_set "$field" "$place_field_text" "$place" ;;
+					email) emit_field_if_set "$field" "$email_field_text" "$email" ;;
+					edition) emit_field_if_set "$field" "$edition_field_text" "$edition" ;;
+					editor) emit_field_if_set "$field" "$editor_field_text" "$editor" ;;
+					volume) emit_field_if_set "$field" "$volume_field_text" "$volume" ;;
+					series) emit_field_if_set "$field" "$series_field_text" "$series" ;;
+					column) emit_field_if_set "$field" "$column_field_text" "$column" ;;
+					document_number) emit_field_if_set "$field" "$document_number_field_text" "$document_number" ;;
+					references) emit_field_if_set "$field" "$references_field_text" "$references" ;;
+					translator) emit_field_if_set "$field" "$translator_field_text" "$translator" ;;
+					platform) emit_field_if_set "$field" "$platform_field_text" "$platform" ;;
+					duration) emit_field_if_set "$field" "$duration_field_text" "$duration" ;;
+					channel) emit_field_if_set "$field" "$channel_field_text" "$channel" ;;
+					site) emit_field_if_set "$field" "$site_field_text" "$site" ;;
+					issue_number) emit_field_if_set "$field" "$issue_number_field_text" "$issue_number" ;;
+					medium) emit_field_if_set "$field" "$medium_field_text" "$medium" ;;
+					collection) emit_field_if_set "$field" "$collection_field_text" "$collection" ;;
+					dimensions) emit_field_if_set "$field" "$dimensions_field_text" "$dimensions" ;;
+					depicted) emit_field_if_set "$field" "$depicted_field_text" "$depicted" ;;
+					esac
+			done < <(get_metadata_collection "$key")
+		fi
+
+#
+##                    comment)
+##                        [[ -z "$comment" ]] && continue
+##                        comment_formatted="$(echo "$comment" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph)"
+##                        non_standard_citation_format+="<span class=\"text-comment note\">${comment_formatted}</span>"
+##                        ((field_count++))||:
+##                        ;;
+##                    quotation)
+##                        [[ -z "$quotation" ]] && continue
+##                        non_standard_citation_format+="<blockquote class=\"after-note\">${quotation_formatted}</blockquote>$__forbidden_text_processing_marker2 "
+##                        ((field_count++))||:
+##                        ;;
+##                    contextualization)
+##                        [[ -z "$contextualization" ]] && continue
+##                        contextualization_formatted="$(echo "$contextualization" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph)"
+##                        non_standard_citation_format+="<span class=\"text-contextualization note\">( ${contextualization_formatted} )</span>"
+##                        ((field_count++))||:
+##                        ;;
+#                esac
+
+		 if ! has_metadata "attribute" "$key" && ! $disable_extended_fields; then
+			[[ -n "$citation" ]] && non_standard_citation_format+="<span class=\"text-citation\">${citation}</span>$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$bibliography" ]] && non_standard_citation_format+="${bibliography_formatted}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$photographers" ]] && non_standard_citation_format+="$photographer_field_text: ${photographers}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$address" ]] && non_standard_citation_format+="$address_field_text: ${address}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$email" ]] && non_standard_citation_format+="$email_field_text: ${email}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$date_taken" ]] && non_standard_citation_format+="$taken_on_field_text: ${date_taken}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$location" ]] && non_standard_citation_format+="$location_field_text: ${location}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$journal" ]] && non_standard_citation_format+="$journal_field_text: ${journal}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$editor" ]] && non_standard_citation_format+="$editor_field_text: ${editor}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$publisher" ]] && non_standard_citation_format+="$publisher_field_text: ${publisher}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$date_last_visited" ]] && non_standard_citation_format+="$last_viewed_field_text: ${date_last_visited}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$place" ]] && non_standard_citation_format+="$place_field_text: ${place}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$edition" ]] && non_standard_citation_format+="$edition_field_text: ${edition}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$volume" ]] && non_standard_citation_format+="$volume_field_text: ${volume}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$series" ]] && non_standard_citation_format+="$series_field_text: ${series}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$column" ]] && non_standard_citation_format+="$column_field_text: ${column}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$document_number" ]] && non_standard_citation_format+="$document_number_field_text: ${document_number}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$references" ]] && non_standard_citation_format+="$references_field_text: ${references}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$translator" ]] && non_standard_citation_format+="$translator_field_text: ${translator}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$platform" ]] && non_standard_citation_format+="$platform_field_text: ${platform}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$duration" ]] && non_standard_citation_format+="$duration_field_text: ${duration}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$channel" ]] && non_standard_citation_format+="$channel_field_text: ${channel}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$site" ]] && non_standard_citation_format+="$site_field_text: ${site}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$issue_number" ]] && non_standard_citation_format+="$issue_number_field_text: ${issue_number}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$medium" ]] && non_standard_citation_format+="$medium_field_text: ${medium}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$collection" ]] && non_standard_citation_format+="$collection_field_text: ${collection}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$dimensions" ]] && non_standard_citation_format+="$dimensions_field_text: ${dimensions}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$depicted" ]] && non_standard_citation_format+="$depicted_field_text: ${depicted}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$subtitle" ]] && non_standard_citation_format+="<span class=\"subtitle\">${subtitle}</span> $list_style_separator" && subtitle=""
+			[[ -n "$additional_url" ]] && non_standard_citation_format+="$additional_url_field_text: ${additional_url}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$mirror_url" ]] && non_standard_citation_format+="$mirror_url_field_text: ${mirror_url}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$archive_url" ]] && non_standard_citation_format+="$archive_url_field_text: ${archive_url}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+
+			if [[ -n "$comment" ]]; then
+				comment_formatted="$(echo "$comment" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+				non_standard_citation_format+="<span class=\"text-comment note\">${comment_formatted}</span>" && ((field_count++))||:
+			fi
+		fi
+
+		if ! has_metadata "attribute" "$key" && ! $hide_citation_only_fields && ! $disable_extended_fields; then
+			if [[ -n "$quotation" ]]; then
+				character="‧" # "⁞"
+
+				non_standard_citation_format+="<blockquote class=\""
+				(( field_count == 0 )) && non_standard_citation_format+="no-spacing"
+				(( field_count > 0 )) && non_standard_citation_format+=" after-note"
+				[[ -z "$authors" && -z "$page" && -z "$timestamp" && -z "$section" ]] && non_standard_citation_format+=" quote-only"
+				non_standard_citation_format+="\">${quotation_formatted}"
+
+#				if [[ -z "$authors" ]]; then
+#					authors="(nicht verfügbar)"
+#					authors_formatted="$authors"
+#				fi
+
+				[[ -n "$authors" || -n "$page" || -n "$timestamp" ]] && non_standard_citation_format+="<span class=\"citation\"><br/>— $authors_formatted"
+				[[ -n "$page" ]] && non_standard_citation_format+=" $character $page_field_text ${page}" && page=""
+				[[ -n "$timestamp" ]] && non_standard_citation_format+=" $character $timestamp_field_text ${timestamp}" && timestamp=""
+				[[ -n "$section" ]] && non_standard_citation_format+=" $character ${section}" && section=""
+				[[ -n "$authors" || -n "$page" || -n "$timestamp" ]] && non_standard_citation_format+="</span>"
+
+				non_standard_citation_format+="</blockquote>"
+				non_standard_citation_format+="$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			fi
+
+			[[ -n "$subtitle" ]] && non_standard_citation_format+="$subtitle_field_text: ${subtitle}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$section" ]] && non_standard_citation_format+="$section_field_text: ${section}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$page" ]] && non_standard_citation_format+="$page_field_text: ${page}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+			[[ -n "$timestamp" ]] && non_standard_citation_format+="$timestamp_field_text: ${timestamp}$__forbidden_text_processing_marker2 " && ((field_count++))||:
+		fi
+
+		if ! has_metadata "attribute" "$key" && ! $disable_extended_fields; then
+			if [[ -n "$contextualization" ]]; then
+				contextualization_formatted="$(echo "$contextualization" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+				non_standard_citation_format+="<span class=\"text-contextualization note\">${contextualization_formatted}</span>" && ((field_count++))||:
+			fi
+		fi
+
+		non_standard_citation_format="${non_standard_citation_format%"$__forbidden_text_processing_marker2 "}"
+		local citation="$fixed_citation"
+
+		if has_metadata "attribute" "$key" && ! $disable_extended_fields; then
+			if [[ -z "$attribute_formatted" ]]; then
+				if is_attribute_node "$key" && [[ "$type" == "default" && -z "$data_kind" ]]; then
+					citation="<span class=\"attribute-node-symbol\">⋅</span>$citation<span class=\"attribute-node-no-header attribute-node-text\">$non_standard_citation_format</span> "
+				else
+					citation="$citation ++++++++++++++ $non_standard_citation_format "
+				fi
+			else
+				citation+="$non_standard_citation_format</span> "
+			fi
+		elif ! has_metadata "attribute" "$key" && [[ -n "$non_standard_citation_format" ]]; then
+			if [[ -n "$citation" ]]; then
+				citation="<span class=\"text-header\">$citation</span> "
+				citation+="$non_standard_citation_format"
+			else
+				citation+="<span class=\"text-no-header\">$non_standard_citation_format</span> "
+			fi
+		fi
+
+		if $list_style; then
+			citation="${citation//"$__forbidden_text_processing_marker2 "/"$list_style_separator"}"
+			citation="${citation//" $__forbidden_text_processing_marker1 "/"$inner_list_style_separator"}"
+		fi
+
+	indent_levels="$depth"
+	if is_under_reference "$key"; then
+		:
+	elif is_attribute_node "$key"; then
+		walk="$key"
+		while [[ -n "$walk" ]]; do
+			walk_type="$(get_metadata "_type" "$walk")"
+			walk_kind="${walk_type#*:}"
+			walk_type="${walk_type%%:*}"
+			[[ "$walk_type" == "$walk_kind" ]] && walk_kind=""
+			[[ -z "$walk_type" && -n "$walk_kind" ]] && walk_type="default"
+
+			if [[ "$walk_kind" == "attribute" ]]; then
+				increase_indent=1
+				[[ "$walk_type" == "default" ]] && increase_indent=0
+				indent_levels=$(( increase_indent + depth - ${entry_depth[$walk]:-0} ))
+				(( indent_levels < 0 )) && indent_levels=0
+				break
+			fi
+			walk="$(parent_index_of "$walk")" || break
+		done
+	fi
+
+		local indent_width=$((indent_levels * 40))
+		((indent_width < 0)) && indent_width=0
+
+		local heading
+		if $heading_prefer_id; then
+			heading="$entry_key"
+		#elif is_attribute_node "$key" && [[ "$data_kind" == "attribute" ]]; then
+		#    heading=""
+		else
+			heading="$source"
+		fi
+#
+#		if (( total_duplicates > 1 )); then
+#			heading="${entry_key} (#${dup_number}/$total_duplicates) $heading"
+#		fi
+
+		local node_class="node-attribute"
+		if [[ -z "$parent_index" ]] || is_dual_root_node "$key" "$depth"; then
+			node_class="node-work"
+		elif [[ "$id" == *"※"* ]]; then
+			node_class="node-reference"
+		fi
+
+		anonymous2=false
+		if $anonymous && [[ "$type" != "default" && "$data_kind" != "attribute" ]]; then
+			anonymous2=true
+		fi
+
+		echo -n "  <table class=\"$node_class"; $anonymous2 && echo -n " anonymous"; echo '">'
+		echo '    <tr>'
+		echo '      <td style="width: '"$indent_width"'px; min-width: '"$indent_width"'px;"></td>'
+		if [[ -n "$icon_font" ]]; then
+			echo -n '      <td class="icon';$anonymous && echo -n ' anonymous';echo '" style="font-family: '"$icon_font"';">'"$icon"'</td>'
+		else
+			echo -n '      <td class="icon';$anonymous && echo -n ' anonymous';echo '"></td>'
+		fi
+		echo '      <td class="content">'
+
+		local heading_prefix=""
+		if $__debug; then
+			local entry_number_output=$((entry_number))||:
+			heading_prefix="|${entry_number_output}|&nbsp;&nbsp;&nbsp;&nbsp;"
+		fi
+
+		if ! $anonymous; then
+			heading="$(echo "$heading" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph)"
+
+			if [[ "$type" == "author" ]]; then
+				heading="$names_formatted"
+				heading_prefer_id=false
+			fi
+
+			reference_data_tag=""
+			if $heading_prefer_id && [[ "$id" == *"※"* ]]; then
+				heading="❮${heading_prefix}${heading}❯"
+				reference_data_tag="${id#*"※"}"
+			else
+				heading="${heading_prefix}${heading}"
+			fi
+
+			#@todo also check url attribute, @todo
+			if [[ -z "$reference_data_tag" && "$data_kind" == "url" ]]; then
+				[[ -z "$id" ]] && id="$parent"
+				reference_data_tag="${id#*"※"}/$(sanitize_url_for_dirname "$source")"
+			fi
+
+			heading="${heading//"—"/"  —&nbsp;&nbsp;"}"
+
+			#if [[ -n "$id" ]]; then #@bug: https://github.com/Kozea/WeasyPrint/issues/1694
+			#    echo "        <div class=\"header\"><strong><a href=\"http://127.0.0.1:8080/${id}\" title=\"Local archive: show-weblink ${id}\">${heading_prefix}${heading}</a></strong></div>"
+			#else
+
+			echo -n "        <div class=\"header\""
+			if [[ -n "$reference_data_tag" ]]; then
+				echo -n " data-reference=\"http://127.0.0.1:8080/$reference_data_tag\"><strong> ${heading}</strong><a style=\"display: none\" onclick=\"openTabFromParent(this)\" class=\"button-icon\">$icon_link</a>"
+				reference_data_tag=""
+			else
+				echo -n "><strong>${heading}</strong>"
+			fi
+			echo  "</div>"
+			#fi
+		else
+			#@todo also check url attribute, @todo
+			if [[ -z "$reference_data_tag" && "$data_kind" == "url" ]]; then
+				[[ -z "$id" ]] && id="$parent"
+				reference_data_tag="${id#*"※"}/$(sanitize_url_for_dirname "$source")"
+			fi
+
+			citation="$heading_prefix$citation"
+		fi
+
+		echo -n '        <div class="'
+		[[ "$type" == "default" && -z "$data_kind" ]] && echo -n ' attribute-node'
+		if [[ -n "$reference_data_tag" ]]; then
+			echo "\" data-reference=\"http://127.0.0.1:8080/$reference_data_tag\">"
+		else
+			echo '">'
+		fi
+
+		#echo "$indent_levels:$type:$data_kind:$citation</div>"
+		echo "          $citation"
+
+		if [[ -n "$reference_data_tag" ]]; then
+			echo -n "<a style=\"display: none\" onclick=\"openTabFromParent(this)\" class=\"button-icon\">$icon_link</a>"
+		fi
+		echo "        </div>"
+
+		#echo -n '        <div class="'; [[ "$type" == "default" && -z "$data_kind" ]] && echo -n ' attribute-node';echo '">'"$citation"'</div>'
+		#echo -n '        <div class="'; echo -n ' attribute-node';echo '">'"$citation"'</div>'
+		echo '      </td>'
+		echo '    </tr>'
+		echo '  </table>'
+	done
+
+	echo '</body>'
+	echo '</html>'
+
+	return 0
+}
