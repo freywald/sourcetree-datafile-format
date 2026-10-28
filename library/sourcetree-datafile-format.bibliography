@@ -118,9 +118,9 @@ verify_types_and_entry_data() {
 			[[ -z "$data_type" && -n "$data_kind" ]] && data_type="default"
 
 			case "$data_type" in
-				default|attribute|author|person|book|video|notebook|essay|webpage|url|paper|report|booklet|log|painting|portrait|local|path) ;;
+				default|attribute|author|person|captioned-image|book|video|notebook|essay|webpage|url|paper|report|booklet|log|painting|portrait|local|path) ;;
 				*)
-					__warn "unknown _type %s on %s" "$own_type" "$entry"
+					__warn "unknown _type %s on %s // %s" "$own_type" "$entry" "$data_type"
 					status=1
 					;;
 			esac
@@ -725,6 +725,12 @@ export_bibliography_ex10dead() {
 				[[ -z "$icon" ]] && icon="$icon_person"
 				[[ -z "$icon_font" ]] && icon_font="SegoeUISymbol"
 				;;
+			captioned-image)
+				[[ -z "$data_kind" ]] && data_kind="title"
+				[[ -z "$title" ]] && title="$(get_value "$key" "_")"
+				icon=""
+				icon_font=""
+				;;
 			book)
 				[[ -z "$data_kind" ]] && data_kind="title"
 				[[ -z "$title" ]] && title="$(get_value "$key" "_")"
@@ -919,6 +925,20 @@ export_bibliography_ex10dead() {
 								names=""
 							fi
 						fi
+					else
+						__warn "default entry attributes by type %s not set id: %s parent: $parent" "$type" "[$id] $entry_key" "$parent"
+						fixed_citation="<span class=\"invalid\">invalid</span>"
+					fi
+				fi
+				;;
+			captioned-image)
+				if ! $minimal && [[ -z "$fixed_citation" ]]; then
+					if has_metadata "attribute" "$key"; then
+						fixed_citation="$attribute_formatted"
+					elif [[ -n "$title" ]]; then
+						[[ -z "$date" && -n "$date_published" ]] && date_formatted="(${date_published})"
+						title_formatted="$(echo "$title" | pandoc --from markdown --to html5 --wrap=none | strip_outer_paragraph )"
+						fixed_citation="${title_formatted} ${date_formatted}"
 					else
 						__warn "default entry attributes by type %s not set id: %s parent: $parent" "$type" "[$id] $entry_key" "$parent"
 						fixed_citation="<span class=\"invalid\">invalid</span>"
