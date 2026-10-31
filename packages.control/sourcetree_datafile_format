@@ -1,0 +1,13 @@
+#!/bin/bash
+
+function sourcetree_datafile_format_setup() {
+	__info "setting up sourcetree_datafile_format"
+
+	cd "$__sourcetree_datafile_format_library_path/"
+
+	echo "$PWD"
+
+	__success "setting up sourcetree_datafile_format"
+}
+
+register_handler "sourcetree_datafile_format" "sourcetree_datafile_format_setup"
