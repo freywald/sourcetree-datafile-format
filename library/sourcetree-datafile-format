@@ -142,7 +142,7 @@ function parse_sources_file() {
 			[[ -n "$preset_uscore" ]] || _current_metadata_collection+=("true:_=")
 		fi
 
-		sources_list[$index]="$stored"
+		sources_list["$index"]="$stored"
 
 		local entry_key="$stored"
 		if [[ -n "$meta_id" ]]; then
@@ -154,8 +154,8 @@ function parse_sources_file() {
 		_set_metadata_by_key_from_current_metadata "_entry_number" "$entry_counter" "_current_metadata_collection"
 		((entry_counter++)) || :
 
-		if [[ -n "${source_to_indices[$entry_key]+set}" ]]; then
-			source_to_indices["$entry_key"]="${source_to_indices[$entry_key]} $index"
+		if [[ -n "${source_to_indices["$entry_key"]+set}" ]]; then
+			source_to_indices["$entry_key"]="${source_to_indices["$entry_key"]} $index"
 		else
 			source_to_indices["$entry_key"]="$index"
 		fi
@@ -528,7 +528,7 @@ has_title_descendant() {
 	own_id="$(get_metadata "_id" "$index")"
 	[[ -z "$own_id" ]] && return 1
 
-	local children_string="${parent_to_children[$own_id]-}"
+	local children_string="${parent_to_children["$own_id"]-}"
 	local -a children=($children_string)
 	for child_index in "${children[@]}"; do
 		is_title_node "$child_index" && return 0
