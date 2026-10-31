@@ -109,7 +109,7 @@ function parse_sources_file() {
 
 	if ! $append; then
 		sources_list=()
-		source_to_indices=()
+		declare -g -A source_to_indices=()
 		sources_metadata=()
 		metadata_positions=()
 		entry_counter=0
@@ -160,7 +160,7 @@ function parse_sources_file() {
 			source_to_indices["$entry_key"]="$index"
 		fi
 
-		metadata_positions[$index]="${#sources_metadata[@]}:${#_current_metadata_collection[@]}"
+		metadata_positions["$index"]="${#sources_metadata[@]}:${#_current_metadata_collection[@]}"
 		sources_metadata+=("${_current_metadata_collection[@]}")
 		_current_metadata_collection=()
 
