@@ -1423,7 +1423,7 @@ export_bibliography_ex10dead() {
 			#@todo also check url attribute, @todo
 			if [[ -z "$reference_data_tag" && "$data_kind" == "url" ]]; then
 				[[ -z "$id" ]] && id="$parent"
-				reference_data_tag="${id#*"※"}/$(sanitize_url_for_dirname "$source")"
+				reference_data_tag="${id#*"※"}/$(sanitize_url_for_directoryname "$source")"
 			fi
 
 			heading="${heading//"—"/"  —&nbsp;&nbsp;"}"
@@ -1445,7 +1445,7 @@ export_bibliography_ex10dead() {
 			#@todo also check url attribute, @todo
 			if [[ -z "$reference_data_tag" && "$data_kind" == "url" ]]; then
 				[[ -z "$id" ]] && id="$parent"
-				reference_data_tag="${id#*"※"}/$(sanitize_url_for_dirname "$source")"
+				reference_data_tag="${id#*"※"}/$(sanitize_url_for_directoryname "$source")"
 			fi
 
 			citation="$heading_prefix$citation"
